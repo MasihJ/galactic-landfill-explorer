@@ -46,18 +46,31 @@ import folium
 import matplotlib.pyplot as plt
 import seaborn as sns
 from streamlit_folium import folium_static
-from folium.plugins import MarkerCluster
+from folium.plugins import MarkerCluster, HeatMap
 from scipy.spatial import cKDTree
 import time
 import random
 import hashlib
+import folium
+from folium.plugins import MeasureControl, Draw
 
-# Set page config first
+# Set page config first - must be at the very top
 st.set_page_config(
     page_title="Galactic Landfill Explorer", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Initialize session state variables before any UI elements
+if 'init' not in st.session_state:
+    st.session_state.init = True
+    st.session_state.cluster_fiber = True  # Initialize fiber clustering toggle
+    st.session_state.map_created = False
+    st.session_state.filter_hash = ""
+    st.session_state.need_map_update = True
+    st.session_state.show_all_landfills = False
+    st.session_state.show_fiber = False  # Initialize fiber toggle
+    st.session_state.fiber_markers = "All Nearest Points"  # Initialize marker option
 
 # Add CSS to improve performance
 st.markdown("""
@@ -70,13 +83,6 @@ st.markdown("""
     .stDataFrame {max-height: 400px;}
 </style>
 """, unsafe_allow_html=True)
-
-# Initialize session state
-if 'init' not in st.session_state:
-    st.session_state.init = True
-    st.session_state.map_created = False
-    st.session_state.filter_hash = ""
-    st.session_state.need_map_update = True
 
 # Function definitions
 def haversine_np(lon1, lat1, lon2, lat2):
@@ -125,15 +131,16 @@ def assign_nearest_city_fast(landfill_df, cities_df):
 def load_landfills():
     """Load and prepare landfill data."""
     try:
-        # Load only needed columns for better performance
-        needed_columns = ["Landfill Name", "State", "City", "County", "Latitude", "Longitude", 
-                         "Percent Methane", "LFG Collected (mmscfd)", "Ownership Type",
-                         "Current Landfill Status", "LFG Collection System In Place?",
-                         "Flares in Place?", "Passive Venting/Flaring?", "Landfill Closure Year",
-                         "Waste in Place (tons)", "Waste in Place Year", "Annual Waste Acceptance Year",
-                         "Current Landfill Depth (feet)"]
-        
-        df = pd.read_excel("landfilllmopdata.xlsx", sheet_name="LMOP Database")
+        # Check if fiber data CSV exists first
+        try:
+            df = pd.read_csv("landfills_with_fiber_data.csv")
+            st.success("Loaded landfill data with fiber connectivity information.")
+            has_fiber_data = True
+        except FileNotFoundError:
+            # Fallback to original Excel file if CSV not found
+            df = pd.read_excel("landfilllmopdata.xlsx", sheet_name="LMOP Database")
+            has_fiber_data = False
+            st.warning("Fiber connectivity data not found. Loading basic landfill data only.")
         
         # Clean data
         df.columns = df.columns.astype(str).str.strip()
@@ -144,6 +151,21 @@ def load_landfills():
         df["Waste in Place (tons)"] = pd.to_numeric(df["Waste in Place (tons)"], errors="coerce")
         df["Annual Waste Acceptance Year"] = pd.to_numeric(df["Annual Waste Acceptance Year"], errors="coerce")
         df["Current Landfill Depth (feet)"] = pd.to_numeric(df["Current Landfill Depth (feet)"], errors="coerce")
+        
+        # Convert fiber-specific columns if they exist
+        if has_fiber_data:
+            df["Nearest_Fiber_Distance_km"] = pd.to_numeric(df["Nearest_Fiber_Distance_km"], errors="coerce")
+            df["Fiber_Technology"] = pd.to_numeric(df["Fiber_Technology"], errors="coerce")
+            df["Fiber_Download_Speed"] = pd.to_numeric(df["Fiber_Download_Speed"], errors="coerce")
+            df["Fiber_Locations_Within_10km"] = pd.to_numeric(df["Fiber_Locations_Within_10km"], errors="coerce")
+            
+            # Set boolean flags for proximity if they exist
+            if "Has_Fiber_Within_1km" in df.columns:
+                df["Has_Fiber_Within_1km"] = df["Has_Fiber_Within_1km"].astype(bool)
+            if "Has_Fiber_Within_5km" in df.columns:
+                df["Has_Fiber_Within_5km"] = df["Has_Fiber_Within_5km"].astype(bool)
+            if "Has_Fiber_Within_10km" in df.columns:
+                df["Has_Fiber_Within_10km"] = df["Has_Fiber_Within_10km"].astype(bool)
         
         return df.dropna(subset=["Latitude", "Longitude"])
     except Exception as e:
@@ -165,9 +187,13 @@ def load_cities():
 def get_filter_hash(filters):
     return hashlib.md5(str(filters).encode()).hexdigest()
 
+# Helper function to check if a dataframe has fiber data
+def has_fiber_data(df):
+    return "Nearest_Fiber_Distance_km" in df.columns
+
 # MAIN APP FUNCTION
 def main():
-    st.title("Galactic Landfill Explorer")
+    st.title("Galactic Landfill Explorer with Fiber Connectivity")
     
     # Load data
     cities_df = load_cities()
@@ -176,6 +202,9 @@ def main():
     if landfill_df.empty or cities_df.empty:
         st.error("Could not load necessary data. Please check your data files.")
         return
+    
+    # Check if fiber data is available
+    fiber_data_available = has_fiber_data(landfill_df)
     
     # SIDEBAR CONTROLS
     st.sidebar.title("Controls")
@@ -189,6 +218,26 @@ def main():
     
     # Map display options
     st.sidebar.header("Map Display")
+    
+    # Add measurement tools guide - ADD THIS NEW CODE
+    with st.sidebar.expander("Measurement Tools", expanded=False):
+        st.markdown("""
+        ### How to use the measurement tools:
+        
+        1. **Simple Distance**: Click the ruler icon (📏) on the left side of the map, 
+           then click "Polyline" to measure distances between points.
+           
+        2. **Custom Routes**: Click the pencil icon (✏️) on the left side of the map, 
+           then draw lines or shapes to measure your own custom fiber routes.
+           
+        3. **Calculate**: After drawing, the distance will appear in kilometers and miles.
+           
+        4. **Erase**: Press the trash icon to clear your measurements and start over.
+        """)
+        
+        st.info("💡 Tip: Use polylines to trace along roads for more accurate distance estimates than straight-line measurements.")
+
+    
     exclude_missing = st.sidebar.checkbox(
         "Exclude landfills with missing key fields", 
         value=True, 
@@ -255,9 +304,13 @@ def main():
     )
     
     # Sorting options
+    sort_options = ["None", "Percent Methane", "LFG Collected (mmscfd)"]
+    if fiber_data_available:
+        sort_options.extend(["Nearest_Fiber_Distance_km", "Fiber_Download_Speed", "Fiber_Locations_Within_10km"])
+        
     sort_by = st.sidebar.selectbox(
         "Sort by", 
-        ["None", "Percent Methane", "LFG Collected (mmscfd)"], 
+        sort_options, 
         key="sort_by",
         help="Sort the landfill data based on a specific criterion. Higher values will appear first in the data tables."
     )
@@ -323,10 +376,24 @@ def main():
                 if opts:
                     df = df[df[col].isin(opts)]
     
+    # Add Fiber Provider filter if available
+    if fiber_data_available and "Fiber_Provider" in df.columns:
+        fiber_providers = sorted(df["Fiber_Provider"].dropna().unique())
+        if len(fiber_providers) <= 30:  # Only show if not too many options
+            selected_providers = st.sidebar.multiselect(
+                "Fiber Provider", 
+                fiber_providers,
+                key="fiber_provider_filter",
+                help="Select one or more fiber providers to filter landfills."
+            )
+            categorical_selections["Fiber_Provider"] = selected_providers
+            if selected_providers:
+                df = df[df["Fiber_Provider"].isin(selected_providers)]
+    
     # Function for numeric sliders
     numeric_selections = {}
     
-    def optional_slider(df, col, label, help_text):
+    def optional_slider(df, col, label, help_text, unit=""):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
             valid_data = df[col].dropna()
@@ -341,7 +408,7 @@ def main():
                         st.sidebar.warning(f"All values for {label} are {lo}, can't filter.")
                         return df, None
                     minval, maxval = st.sidebar.slider(
-                        label, lo, hi, (lo, hi), key=f"slider_{col}"
+                        f"{label} {unit}", lo, hi, (lo, hi), key=f"slider_{col}"
                     )
                     numeric_selections[col] = (minval, maxval)
                     return df[df[col].between(minval, maxval)], (minval, maxval)
@@ -352,11 +419,13 @@ def main():
     
     # Numeric filters
     st.sidebar.header("Numeric Filters")
+    
+    # Original landfill metrics
     df, _ = optional_slider(df, "Percent Methane", "% Methane", 
                            "Filter landfills based on their methane percentage. Higher values typically indicate better energy potential.")
     df, _ = optional_slider(df, "LFG Collected (mmscfd)", "LFG Collected", 
                            "Filter by Landfill Gas collected in million standard cubic feet per day. Higher values indicate greater production capacity.")
-    # Only include Distance to City slider if we're calculating it
+    
     # Only include Distance to City slider if we're calculating it
     if assign_cities and "Distance to City (km)" in df.columns:
         if st.sidebar.checkbox(
@@ -375,16 +444,62 @@ def main():
             )
             numeric_selections["Distance to City (km)"] = (minval, maxval)
             df = df[df["Distance to City (km)"].between(minval, maxval)]
+    
     df, _ = optional_slider(df, "Landfill Closure Year", "Closure Year",
                            "Filter landfills based on when they closed or are projected to close. Impacts long-term gas production potential.")
     
-    # New numeric filters for additional fields
+    # Waste and depth filters
     df, _ = optional_slider(df, "Waste in Place (tons)", "Waste in Place", 
                            "Filter landfills based on the total amount of waste in the landfill in tons.")
     df, _ = optional_slider(df, "Annual Waste Acceptance (tons per year)", "Annual Waste Acceptance", 
                            "Filter landfills based on how much waste they accept annually in tons per year.")
     df, _ = optional_slider(df, "Design Landfill Depth (feet)", "Landfill Depth", 
                            "Filter landfills based on their designed depth in feet.")
+    
+    # Add fiber-specific filters if available
+    if fiber_data_available:
+        st.sidebar.header("Fiber Connectivity Filters")
+        
+        # Fiber distance filter
+        df, _ = optional_slider(df, "Nearest_Fiber_Distance_km", "Nearest Fiber Distance", 
+                              "Filter landfills based on their distance to the nearest fiber infrastructure.", "(km)")
+        
+        # Fiber technology filter (if available)
+        df, _ = optional_slider(df, "Fiber_Technology", "Fiber Technology", 
+                              "Filter landfills based on the fiber technology type.")
+        
+        # Fiber download speed filter (if available)
+        df, _ = optional_slider(df, "Fiber_Download_Speed", "Fiber Download Speed", 
+                              "Filter landfills based on the available download speed.", "(Mbps)")
+        
+        # Fiber locations count filter (if available)
+        df, _ = optional_slider(df, "Fiber_Locations_Within_10km", "Fiber Locations Within 10km", 
+                              "Filter landfills based on the number of fiber locations within a 10km radius.")
+        
+        # Boolean fiber availability filters
+        if "Has_Fiber_Within_1km" in df.columns:
+            has_fiber_1km = st.sidebar.radio(
+                "Has Fiber Within 1km",
+                ["All", "Yes", "No"],
+                key="has_fiber_1km",
+                help="Filter landfills based on fiber availability within 1km."
+            )
+            if has_fiber_1km == "Yes":
+                df = df[df["Has_Fiber_Within_1km"] == True]
+            elif has_fiber_1km == "No":
+                df = df[df["Has_Fiber_Within_1km"] == False]
+        
+        if "Has_Fiber_Within_5km" in df.columns:
+            has_fiber_5km = st.sidebar.radio(
+                "Has Fiber Within 5km",
+                ["All", "Yes", "No"],
+                key="has_fiber_5km",
+                help="Filter landfills based on fiber availability within 5km."
+            )
+            if has_fiber_5km == "Yes":
+                df = df[df["Has_Fiber_Within_5km"] == True]
+            elif has_fiber_5km == "No":
+                df = df[df["Has_Fiber_Within_5km"] == False]
     
     # Create filter hash to detect changes
     current_filters = {
@@ -449,7 +564,7 @@ def main():
     annual_revenue = revenue_day * days_per_year
     lifetime_revenue = annual_revenue * years
 
-    # Display metrics in columns for better UI
+    # Display metrics depending on available data
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Total Landfills", f"{len(df):,}")
@@ -460,22 +575,68 @@ def main():
     with col3:
         st.metric("Annual Revenue", f"${annual_revenue:,.0f}")
         st.metric("Lifetime Revenue", f"${lifetime_revenue:,.0f}")
-
-    # Download button - include the calculation columns in the download
-    calc_df_download = calc_df.copy()
-    download_columns = list(df.columns) + ["Methane Volume (scfd)", "Energy Output (MWh)"]
-    st.download_button(
-        "Download Filtered Data with Energy Calculations", 
-        calc_df_download[download_columns].to_csv(index=False), 
-        file_name="filtered_landfills_with_energy.csv"
-    )
     
-    # Download button
-    st.download_button(
-        "Download Filtered Data", 
-        df.to_csv(index=False), 
-        file_name="filtered_landfills.csv"
-    )
+    # Add fiber connectivity metrics if available
+    if fiber_data_available:
+        st.subheader("Fiber Connectivity Stats")
+        fiber_col1, fiber_col2, fiber_col3 = st.columns(3)
+        
+        with fiber_col1:
+            # Average distance to fiber
+            avg_fiber_distance = pd.to_numeric(df["Nearest_Fiber_Distance_km"], errors="coerce").mean()
+            st.metric("Avg Distance to Fiber", f"{avg_fiber_distance:.2f} km")
+            
+            # Count of landfills with fiber within 1km
+            if "Has_Fiber_Within_1km" in df.columns:
+                count_fiber_1km = df["Has_Fiber_Within_1km"].sum()
+                percent_fiber_1km = (count_fiber_1km / len(df)) * 100 if len(df) > 0 else 0
+                st.metric("Landfills with Fiber < 1km", f"{count_fiber_1km} ({percent_fiber_1km:.1f}%)")
+        
+        with fiber_col2:
+            # Median distance to fiber
+            median_fiber_distance = pd.to_numeric(df["Nearest_Fiber_Distance_km"], errors="coerce").median()
+            st.metric("Median Distance to Fiber", f"{median_fiber_distance:.2f} km")
+            
+            # Count of landfills with fiber within 5km
+            if "Has_Fiber_Within_5km" in df.columns:
+                count_fiber_5km = df["Has_Fiber_Within_5km"].sum()
+                percent_fiber_5km = (count_fiber_5km / len(df)) * 100 if len(df) > 0 else 0
+                st.metric("Landfills with Fiber < 5km", f"{count_fiber_5km} ({percent_fiber_5km:.1f}%)")
+        
+        with fiber_col3:
+            # Maximum download speed 
+            if "Fiber_Download_Speed" in df.columns:
+                max_download = pd.to_numeric(df["Fiber_Download_Speed"], errors="coerce").max()
+                st.metric("Max Download Speed", f"{max_download:.0f} Mbps")
+            
+            # Count of landfills with fiber within 10km
+            if "Has_Fiber_Within_10km" in df.columns:
+                count_fiber_10km = df["Has_Fiber_Within_10km"].sum()
+                percent_fiber_10km = (count_fiber_10km / len(df)) * 100 if len(df) > 0 else 0
+                st.metric("Landfills with Fiber < 10km", f"{count_fiber_10km} ({percent_fiber_10km:.1f}%)")
+
+    # Download buttons for different datasets
+    st.subheader("Download Data")
+    col1, col2 = st.columns(2)
+    
+    # Regular download
+    with col1:
+        st.download_button(
+            "Download Filtered Data", 
+            df.to_csv(index=False), 
+            file_name="filtered_landfills.csv"
+        )
+    
+    # Download with energy calculations
+    with col2:
+        # Include the calculation columns in the download
+        calc_df_download = calc_df.copy()
+        download_columns = list(df.columns) + ["Methane Volume (scfd)", "Energy Output (MWh)"]
+        st.download_button(
+            "Download with Energy Calculations", 
+            calc_df_download[download_columns].to_csv(index=False), 
+            file_name="filtered_landfills_with_energy.csv"
+        )
     
     # MAP SECTION
     st.header("Filtered Landfill Map")
@@ -484,8 +645,15 @@ def main():
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         color_options = ["Percent Methane", "LFG Collected (mmscfd)"]
+        
+        # Add distance to city option if available
         if assign_cities and "Distance to City (km)" in df.columns:
             color_options.append("Distance to City (km)")
+            
+        # Add fiber distance option if available
+        if fiber_data_available:
+            color_options.append("Nearest_Fiber_Distance_km")
+            
         color_by = st.selectbox(
             "Color markers by:", 
             color_options, 
@@ -507,6 +675,49 @@ def main():
     with col3:
         if st.button("Refresh Map", key="refresh_map", help="Force the map to update with current settings."):
             st.session_state.need_map_update = True
+    
+    # Fiber-specific map options if available
+    if fiber_data_available:
+        fiber_map_col1, fiber_map_col2 = st.columns(2)
+        
+        # Define callback functions for widgets
+        def toggle_fiber():
+            st.session_state.need_map_update = True
+            # The widget value will be stored in st.session_state.show_fiber_widget
+        
+        def update_fiber_markers():
+            st.session_state.need_map_update = True
+            # Widget value will be stored in st.session_state.fiber_markers_widget
+        
+        with fiber_map_col1:
+            # Use a different key for the widget
+            show_fiber = st.checkbox(
+                "Show Fiber Infrastructure", 
+                value=st.session_state.show_fiber,
+                key="show_fiber_widget",
+                on_change=toggle_fiber,
+                help="When checked, displays the nearest fiber infrastructure points on the map."
+            )
+        
+        with fiber_map_col2:
+            if show_fiber:  # Use the widget value directly
+                fiber_markers = st.radio(
+                    "Fiber Marker Display",
+                    ["All Nearest Points", "Points within 10km", "Heatmap"],
+                    key="fiber_markers_widget",
+                    on_change=update_fiber_markers,
+                    index=["All Nearest Points", "Points within 10km", "Heatmap"].index(st.session_state.fiber_markers)
+                )
+                
+                # Add fiber clustering toggle
+                cluster_fiber = st.checkbox(
+                    "Cluster Fiber Points", 
+                    value=st.session_state.cluster_fiber,
+                    key="cluster_fiber_widget",
+                    help="When checked, nearby fiber infrastructure points are grouped together as clusters."
+                )
+                # Update session state for fiber clustering
+                st.session_state.cluster_fiber = cluster_fiber
                 
     # Track zoom state with consistent key naming
     if 'current_zoom' not in st.session_state:
@@ -529,6 +740,10 @@ def main():
     if assign_cities and "Distance to City (km)" in df_map.columns:
         missing_check_cols.append("Distance to City (km)")
     
+    # Add fiber distance if it exists
+    if fiber_data_available:
+        missing_check_cols.append("Nearest_Fiber_Distance_km")
+    
     if exclude_missing:
         df_map = df_map.dropna(subset=missing_check_cols)
     
@@ -547,6 +762,36 @@ def main():
                 zoom_start=5,
                 control_scale=True
             )
+            
+            # Add measurement control
+            measure_control = MeasureControl(
+                position='topleft',
+                primary_length_unit='kilometers',
+                secondary_length_unit='miles',
+                primary_area_unit='square kilometers',
+                secondary_area_unit='acres'
+            )
+            m.add_child(measure_control)
+            
+            
+            # Add drawing tools for more advanced measurements
+            draw = Draw(
+                position='topleft',
+                draw_options={
+                    'polyline': True,
+                    'polygon': True,
+                    'rectangle': False,
+                    'circle': False,
+                    'marker': True,
+                    'circlemarker': False,
+                },
+                edit_options={
+                    'poly': {
+                        'allowIntersection': False
+                    }
+                }
+            )
+            m.add_child(draw)
             
             # Check if the selected color column exists
             if color_by in df_map.columns:
@@ -609,7 +854,11 @@ def main():
                     if pd.isna(val) or vmin == vmax:
                         return "gray"
                     scale = (val - vmin) / (vmax - vmin)
-                    return "green" if scale < 0.33 else "orange" if scale < 0.66 else "red"
+                    # Adjust color scheme based on what we're coloring
+                    if "Distance" in color_by:  # For distances (smaller is better)
+                        return "green" if scale < 0.33 else "orange" if scale < 0.66 else "red"
+                    else:  # For other metrics (larger is better)
+                        return "red" if scale < 0.33 else "orange" if scale < 0.66 else "green"
                 
                 df_map['color'] = df_map['val'].apply(get_color)
             else:
@@ -652,6 +901,20 @@ def main():
                         val = row['val']
                         if not pd.isna(val):
                             popup_parts.append(f"{color_by}: {val:.2f}")
+                    
+                    # Add fiber information if available
+                    if fiber_data_available:
+                        fiber_info = []
+                        if "Nearest_Fiber_Distance_km" in row and not pd.isna(row.get("Nearest_Fiber_Distance_km")):
+                            fiber_info.append(f"Fiber Distance: {row.get('Nearest_Fiber_Distance_km'):.2f} km")
+                        if "Fiber_Provider" in row and not pd.isna(row.get("Fiber_Provider")):
+                            fiber_info.append(f"Provider: {row.get('Fiber_Provider')}")
+                        if "Fiber_Download_Speed" in row and not pd.isna(row.get("Fiber_Download_Speed")):
+                            fiber_info.append(f"Speed: {row.get('Fiber_Download_Speed'):.0f} Mbps")
+                        
+                        if fiber_info:
+                            popup_parts.append("<b>Fiber Connectivity:</b>")
+                            popup_parts.extend(fiber_info)
 
                     # Create popup
                     popup = "<br>".join(popup_parts)
@@ -666,10 +929,90 @@ def main():
                 except Exception:
                     continue
             
+            # Add fiber infrastructure points if requested and available
+            if fiber_data_available and show_fiber:  # Use the widget value directly
+                # Get fiber option
+                fiber_display = fiber_markers if show_fiber else "All Nearest Points"
+                
+                if fiber_display == "Heatmap" and "Nearest_Fiber_Lat" in df_map.columns and "Nearest_Fiber_Lon" in df_map.columns:
+                    # Create heatmap of fiber locations
+                    heat_data = []
+                    for _, row in df_map.iterrows():
+                        if not pd.isna(row.get("Nearest_Fiber_Lat")) and not pd.isna(row.get("Nearest_Fiber_Lon")):
+                            heat_data.append([float(row["Nearest_Fiber_Lat"]), float(row["Nearest_Fiber_Lon"])])
+                    
+                    # Add heatmap layer
+                    if heat_data:
+                        HeatMap(heat_data, radius=15).add_to(m)
+                else:
+                    # Check if clustering is enabled
+                    if st.session_state.cluster_fiber:
+                        # Create a special marker cluster with custom settings for fiber points
+                        # These settings make clusters break apart more aggressively when zooming in
+                        fiber_cluster = MarkerCluster(
+                            name="Fiber Clusters",
+                            options={
+                                'maxClusterRadius': 40,  # Smaller radius creates more but smaller clusters
+                                'disableClusteringAtZoom': 9,  # Disable clustering at zoom level 9+
+                                'spiderfyOnMaxZoom': True,  # Spread out markers in a cluster when at max zoom
+                                'showCoverageOnHover': False  # Don't show the covered area
+                            }
+                        )
+                    
+                    # Determine which points to show based on selection
+                    if fiber_display == "Points within 10km":
+                        # Filter to points within 10km
+                        if "Has_Fiber_Within_10km" in df_map.columns:
+                            fiber_df = df_map[df_map["Has_Fiber_Within_10km"] == True]
+                        else:
+                            fiber_df = df_map[df_map["Nearest_Fiber_Distance_km"] <= 10]
+                    else:
+                        # Show all points
+                        fiber_df = df_all  # Use the complete dataset for fiber points
+                    
+                    # Cap the number of fiber points to prevent browser overload
+                    max_fiber_points = 800  # Adjust this number as needed
+                    if len(fiber_df) > max_fiber_points:
+                        st.warning(f"Showing {max_fiber_points} out of {len(fiber_df)} fiber points to maintain performance.")
+                        fiber_df = fiber_df.sample(max_fiber_points)
+                    
+                    # Add individual fiber points
+                    for _, row in fiber_df.iterrows():
+                        if "Nearest_Fiber_Lat" in row and "Nearest_Fiber_Lon" in row:
+                            fiber_lat = row.get("Nearest_Fiber_Lat")
+                            fiber_lon = row.get("Nearest_Fiber_Lon")
+                            
+                            if not pd.isna(fiber_lat) and not pd.isna(fiber_lon):
+                                # Create popup for fiber point
+                                fiber_popup = f"<b>Fiber Infrastructure</b><br>"
+                                if "Fiber_Provider" in row and not pd.isna(row.get("Fiber_Provider")):
+                                    fiber_popup += f"Provider: {row.get('Fiber_Provider')}<br>"
+                                if "Fiber_Download_Speed" in row and not pd.isna(row.get("Fiber_Download_Speed")):
+                                    fiber_popup += f"Speed: {row.get('Fiber_Download_Speed'):.0f} Mbps<br>"
+                                if "Nearest_Fiber_Distance_km" in row and not pd.isna(row.get("Nearest_Fiber_Distance_km")):
+                                    fiber_popup += f"Distance to landfill: {row.get('Nearest_Fiber_Distance_km'):.2f} km<br>"
+                                
+                                # Create the marker
+                                fiber_marker = folium.Marker(
+                                    [float(fiber_lat), float(fiber_lon)],
+                                    popup=folium.Popup(fiber_popup, max_width=300),
+                                    icon=folium.Icon(color="blue", icon="signal", prefix="fa")
+                                )
+                                
+                                # Add to cluster if clustering enabled, otherwise add directly to map
+                                if st.session_state.cluster_fiber:
+                                    fiber_marker.add_to(fiber_cluster)
+                                else:
+                                    fiber_marker.add_to(m)
+                    
+                    # Add fiber cluster to map if clustering is enabled
+                    if st.session_state.cluster_fiber:
+                        fiber_cluster.add_to(m)
+
             # Add cluster to map if enabled
             if enable_clustering:
                 marker_container.add_to(m)
-            
+
             # Complete progress
             progress_bar.progress(1.0)
             time.sleep(0.5)  # Short delay to show complete progress
@@ -680,6 +1023,9 @@ def main():
             st.session_state.need_map_update = False
             st.session_state.map_created = True
             
+            st.session_state.show_fiber = st.session_state.show_fiber_widget
+            if "fiber_markers_widget" in st.session_state:
+                st.session_state.fiber_markers = st.session_state.fiber_markers_widget
             # Success message
             st.success("Map created successfully!")
     
@@ -724,7 +1070,10 @@ def main():
         df_dash = df.copy()
         
         # Create tabs with the added visualizations
-        tab1, tab2, tab3, tab4 = st.tabs(["Missing Data", "Nearest Finder", "Core Visualizations", "Advanced Visualizations"])
+        if fiber_data_available:
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Missing Data", "Nearest Finder", "Core Visualizations", "Advanced Visualizations", "Fiber Connectivity"])
+        else:
+            tab1, tab2, tab3, tab4 = st.tabs(["Missing Data", "Nearest Finder", "Core Visualizations", "Advanced Visualizations"])
         
         with tab1:
             st.subheader("Missing Data Overview")
@@ -775,6 +1124,10 @@ def main():
                                      "LFG Collected (mmscfd)"]
                         if "Distance to City (km)" in nearest:
                             result_cols.append("Distance to City (km)")
+                        
+                        # Add fiber information if available
+                        if fiber_data_available and "Nearest_Fiber_Distance_km" in nearest:
+                            result_cols.append("Nearest_Fiber_Distance_km")
                             
                         st.dataframe(nearest[result_cols])
                         
@@ -797,6 +1150,31 @@ def main():
                             popup="Your Location",
                             icon=folium.Icon(color="blue", icon="info-sign")
                         ).add_to(mini_map)
+                        
+                        # Add fiber point if available
+                        if fiber_data_available and "Nearest_Fiber_Lat" in nearest and "Nearest_Fiber_Lon" in nearest:
+                            fiber_lat = nearest.get("Nearest_Fiber_Lat")
+                            fiber_lon = nearest.get("Nearest_Fiber_Lon")
+                            
+                            if not pd.isna(fiber_lat) and not pd.isna(fiber_lon):
+                                folium.Marker(
+                                    [float(fiber_lat), float(fiber_lon)],
+                                    popup="Nearest Fiber Infrastructure",
+                                    icon=folium.Icon(color="green", icon="signal", prefix="fa")
+                                ).add_to(mini_map)
+                                
+                                # Draw line between landfill and fiber
+                                locations = [
+                                    [float(nearest["Latitude"]), float(nearest["Longitude"])],
+                                    [float(fiber_lat), float(fiber_lon)]
+                                ]
+                                folium.PolyLine(
+                                    locations=locations,
+                                    color="green",
+                                    weight=2,
+                                    opacity=0.7,
+                                    dash_array="5"
+                                ).add_to(mini_map)
                         
                         # Show mini map with unique key
                         folium_static(mini_map, width=700, height=400, key="nearest_landfill_map")
@@ -1214,6 +1592,14 @@ def main():
                         "Current Landfill Depth (feet)"
                     ]
                     
+                    # Add fiber metrics if available
+                    if fiber_data_available and "Nearest_Fiber_Distance_km" in df_dash.columns:
+                        analysis_cols.append("Nearest_Fiber_Distance_km")
+                    if fiber_data_available and "Fiber_Download_Speed" in df_dash.columns:
+                        analysis_cols.append("Fiber_Download_Speed")
+                    if fiber_data_available and "Fiber_Locations_Within_10km" in df_dash.columns:
+                        analysis_cols.append("Fiber_Locations_Within_10km")
+                    
                     # Create a copy and convert to numeric
                     multi_df = df_dash[analysis_cols].copy()
                     for col in multi_df.columns:
@@ -1333,6 +1719,534 @@ def main():
                         st.warning("Insufficient data for multi-factor analysis. More data points with complete information are needed.")
                 except Exception as e:
                     st.error(f"Error creating multiple factors analysis: {e}")
+        
+        # NEW TAB FOR FIBER CONNECTIVITY ANALYSIS
+        if fiber_data_available:
+            with tab5:
+                st.subheader("Fiber Connectivity Analysis")
+                
+                # Create fiber visualization type selector
+                fiber_viz_type = st.selectbox(
+                    "Select Fiber Visualization", 
+                    ["Fiber Distance Distribution", "Fiber Distance vs LFG Production", 
+                     "Fiber Coverage by State", "Fiber Provider Analysis", "Fiber Speed Analysis"],
+                    key="fiber_viz_type"
+                )
+                
+                if fiber_viz_type == "Fiber Distance Distribution":
+                    try:
+                        # Create distribution of fiber distances
+                        fig_fiber_dist, ax_fiber_dist = plt.subplots(figsize=(10, 6))
+                        
+                        # Get fiber distance data
+                        fiber_dist = pd.to_numeric(df_dash["Nearest_Fiber_Distance_km"], errors="coerce")
+                        
+                        # Check for max distance to set reasonable bin range
+                        # Cap at 50km for better visualization
+                        max_dist = min(50, fiber_dist.quantile(0.95))
+                        
+                        # Filter to reasonable distances
+                        fiber_dist = fiber_dist[(fiber_dist >= 0) & (fiber_dist <= max_dist)]
+                        
+                        if not fiber_dist.empty:
+                            # Create histogram with KDE
+                            sns.histplot(
+                                fiber_dist,
+                                kde=True,
+                                bins=30,
+                                ax=ax_fiber_dist
+                            )
+                            ax_fiber_dist.set_title("Distribution of Distances to Nearest Fiber Infrastructure")
+                            ax_fiber_dist.set_xlabel("Distance (km)")
+                            ax_fiber_dist.set_ylabel("Count")
+                            ax_fiber_dist.grid(True, alpha=0.3)
+                            
+                            # Add vertical lines for meaningful thresholds
+                            for dist, color, label in [(1, "green", "1 km"), (5, "orange", "5 km"), (10, "red", "10 km")]:
+                                if dist <= max_dist:
+                                    ax_fiber_dist.axvline(x=dist, color=color, linestyle='--', alpha=0.7)
+                                    ax_fiber_dist.text(dist, ax_fiber_dist.get_ylim()[1]*0.9, label, 
+                                                     rotation=90, color=color, va='top', ha='right')
+                            
+                            st.pyplot(fig_fiber_dist)
+                            
+                            # Display statistics
+                            st.write("### Fiber Distance Statistics")
+                            
+                            # Basic statistics
+                            fiber_stats = fiber_dist.describe()
+                            st.dataframe(fiber_stats)
+                            
+                            # Calculate percentages within key thresholds
+                            within_1km = (df_dash["Nearest_Fiber_Distance_km"] <= 1).sum()
+                            within_5km = (df_dash["Nearest_Fiber_Distance_km"] <= 5).sum()
+                            within_10km = (df_dash["Nearest_Fiber_Distance_km"] <= 10).sum()
+                            total_valid = df_dash["Nearest_Fiber_Distance_km"].notna().sum()
+                            
+                            # Create metrics for fiber proximity
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                pct_1km = (within_1km / total_valid * 100) if total_valid > 0 else 0
+                                st.metric("Within 1 km", f"{within_1km} landfills ({pct_1km:.1f}%)")
+                            with col2:
+                                pct_5km = (within_5km / total_valid * 100) if total_valid > 0 else 0
+                                st.metric("Within 5 km", f"{within_5km} landfills ({pct_5km:.1f}%)")
+                            with col3:
+                                pct_10km = (within_10km / total_valid * 100) if total_valid > 0 else 0
+                                st.metric("Within 10 km", f"{within_10km} landfills ({pct_10km:.1f}%)")
+                            
+                        else:
+                            st.warning("No fiber distance data available for visualization.")
+                    except Exception as e:
+                        st.error(f"Error creating fiber distance distribution: {e}")
+                
+                elif fiber_viz_type == "Fiber Distance vs LFG Production":
+                    try:
+                        # Create scatter plot of fiber distance vs LFG production
+                        fig_fiber_lfg, ax_fiber_lfg = plt.subplots(figsize=(10, 6))
+                        
+                        # Get data for plot
+                        fiber_lfg_data = df_dash.dropna(subset=["Nearest_Fiber_Distance_km", "LFG Collected (mmscfd)"])
+                        
+                        if not fiber_lfg_data.empty:
+                            # Apply cap to fiber distances for better visualization
+                            max_dist = min(50, fiber_lfg_data["Nearest_Fiber_Distance_km"].quantile(0.95))
+                            plot_data = fiber_lfg_data[fiber_lfg_data["Nearest_Fiber_Distance_km"] <= max_dist]
+                            
+                            # Create scatter plot
+                            sns.scatterplot(
+                                data=plot_data,
+                                x="Nearest_Fiber_Distance_km",
+                                y="LFG Collected (mmscfd)",
+                                alpha=0.7,
+                                ax=ax_fiber_lfg
+                            )
+                            
+                            # Add regression line
+                            sns.regplot(
+                                data=plot_data,
+                                x="Nearest_Fiber_Distance_km",
+                                y="LFG Collected (mmscfd)",
+                                scatter=False,
+                                line_kws={"color": "red"},
+                                ax=ax_fiber_lfg
+                            )
+                            
+                            # Calculate correlation
+                            corr = plot_data["Nearest_Fiber_Distance_km"].corr(plot_data["LFG Collected (mmscfd)"])
+                            
+                            ax_fiber_lfg.set_title("Fiber Distance vs LFG Production")
+                            ax_fiber_lfg.set_xlabel("Distance to Nearest Fiber (km)")
+                            ax_fiber_lfg.set_ylabel("LFG Collected (mmscfd)")
+                            ax_fiber_lfg.grid(True, alpha=0.3)
+                            
+                            # Add correlation annotation
+                            ax_fiber_lfg.annotate(f"Correlation: {corr:.2f}", xy=(0.05, 0.95), xycoords="axes fraction",
+                                               bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+                            
+                            st.pyplot(fig_fiber_lfg)
+                            
+                            # Additional analysis - group by distance bins
+                            st.write("### LFG Production by Fiber Distance Range")
+                            
+                            # Create distance bins
+                            bins = [0, 1, 5, 10, 25, 50, float('inf')]
+                            labels = ['0-1', '1-5', '5-10', '10-25', '25-50', '50+']
+                            plot_data['Distance Range (km)'] = pd.cut(
+                                plot_data['Nearest_Fiber_Distance_km'], 
+                                bins=bins, 
+                                labels=labels
+                            )
+                            
+                            # Group by distance range
+                            distance_analysis = plot_data.groupby('Distance Range (km)').agg({
+                                'LFG Collected (mmscfd)': ['count', 'mean', 'std', 'min', 'max'],
+                                'Nearest_Fiber_Distance_km': ['mean']
+                            }).reset_index()
+                            
+                            # Format for display
+                            distance_analysis.columns = ['Distance Range (km)', 'Count', 'Mean LFG', 'Std Dev LFG', 
+                                                       'Min LFG', 'Max LFG', 'Mean Distance']
+                            
+                            # Show the table
+                            st.dataframe(distance_analysis)
+                            
+                            # Create a bar chart of LFG by distance range
+                            fig_dist_bar, ax_dist_bar = plt.subplots(figsize=(10, 5))
+                            bar_data = distance_analysis[distance_analysis['Count'] > 0]  # Only plot where we have data
+                            bar_data.plot(kind='bar', x='Distance Range (km)', y='Mean LFG', 
+                                        yerr='Std Dev LFG', ax=ax_dist_bar, color='lightgreen')
+                            ax_dist_bar.set_title('Average LFG Production by Fiber Distance Range')
+                            ax_dist_bar.set_ylabel('LFG Collected (mmscfd)')
+                            ax_dist_bar.set_xlabel('Distance to Fiber (km)')
+                            plt.xticks(rotation=45)
+                            st.pyplot(fig_dist_bar)
+                            
+                            # Statistical tests and findings
+                            st.write("### Statistical Findings")
+                            
+                            # Calculate averages for close vs distant landfills
+                            close_landfills = plot_data[plot_data["Nearest_Fiber_Distance_km"] <= 5]
+                            distant_landfills = plot_data[plot_data["Nearest_Fiber_Distance_km"] > 5]
+                            
+                            close_avg = close_landfills["LFG Collected (mmscfd)"].mean() if not close_landfills.empty else 0
+                            distant_avg = distant_landfills["LFG Collected (mmscfd)"].mean() if not distant_landfills.empty else 0
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Avg LFG - Close to Fiber (≤5km)", f"{close_avg:.2f} mmscfd")
+                                st.metric("Count - Close to Fiber", f"{len(close_landfills)} landfills")
+                            with col2:
+                                st.metric("Avg LFG - Distant from Fiber (>5km)", f"{distant_avg:.2f} mmscfd")
+                                st.metric("Count - Distant from Fiber", f"{len(distant_landfills)} landfills")
+                            
+                            # Calculate percent difference
+                            if distant_avg > 0:
+                                pct_diff = (close_avg - distant_avg) / distant_avg * 100
+                                diff_text = f"{pct_diff:.1f}% {'higher' if pct_diff > 0 else 'lower'} LFG production for landfills within 5km of fiber"
+                                st.info(diff_text)
+                        else:
+                            st.warning("Insufficient data for Fiber Distance vs LFG Production visualization.")
+                    except Exception as e:
+                        st.error(f"Error creating Fiber vs LFG plot: {e}")
+                
+                elif fiber_viz_type == "Fiber Coverage by State":
+                    try:
+                        # Get data for analysis
+                        if "State" in df_dash.columns and "Nearest_Fiber_Distance_km" in df_dash.columns:
+                            # Calculate fiber coverage metrics by state
+                            state_fiber = df_dash.groupby("State").agg({
+                                "Nearest_Fiber_Distance_km": ["count", "mean", "median", "min"],
+                                # Count landfills within different distances
+                                "Landfill Name": "count"  # Total count
+                            }).reset_index()
+                            
+                            # Rename columns
+                            state_fiber.columns = ["State", "Valid Count", "Mean Distance", "Median Distance", "Min Distance", "Total Count"]
+                            
+                            # Calculate coverage percentages
+                            for dist in [1, 5, 10]:
+                                # Count landfills within each distance threshold
+                                within_dist = df_dash.groupby("State")[f"Has_Fiber_Within_{dist}km"].sum() if f"Has_Fiber_Within_{dist}km" in df_dash.columns else \
+                                              df_dash.groupby("State").apply(lambda x: (x["Nearest_Fiber_Distance_km"] <= dist).sum())
+                                
+                                # Add to the dataframe
+                                state_fiber[f"Within {dist}km"] = within_dist.values
+                                state_fiber[f"Pct Within {dist}km"] = (state_fiber[f"Within {dist}km"] / state_fiber["Valid Count"] * 100).round(1)
+                            
+                            # Sort by fiber coverage (percent within 5km)
+                            state_fiber = state_fiber.sort_values("Pct Within 5km", ascending=False)
+                            
+                            # Display the data table
+                            st.write("### Fiber Coverage by State")
+                            st.dataframe(state_fiber)
+                            
+                            # Create visualization - top states by fiber coverage
+                            top_n = min(15, len(state_fiber))  # Show top 15 states or fewer if data limited
+                            top_states = state_fiber.head(top_n)
+                            
+                            # Bar chart of fiber coverage percentage
+                            fig_state_cov, ax_state_cov = plt.subplots(figsize=(12, 8))
+                            coverage_data = top_states.sort_values("Pct Within 5km")  # Sort for better visualization
+                            
+                            # Create stacked bar chart of percentages
+                            coverage_data.plot(
+                                kind="barh",
+                                x="State",
+                                y=["Pct Within 1km", "Pct Within 5km", "Pct Within 10km"],
+                                ax=ax_state_cov,
+                                stacked=False,
+                                alpha=0.7,
+                                color=["green", "orange", "blue"]
+                            )
+                            
+                            ax_state_cov.set_title("Fiber Coverage by State (% of Landfills)")
+                            ax_state_cov.set_xlabel("Percentage of Landfills")
+                            ax_state_cov.set_xlim(0, 100)
+                            ax_state_cov.grid(True, axis="x", alpha=0.3)
+                            ax_state_cov.legend(["Within 1km", "Within 5km", "Within 10km"])
+                            
+                            st.pyplot(fig_state_cov)
+                            
+                            # Map of fiber coverage by state
+                            st.write("### Average Distance to Fiber by State")
+                            
+                            # Create a choropleth map - this requires additional setup and data
+                            # For now, we'll create a bar chart of average distances
+                            fig_state_dist, ax_state_dist = plt.subplots(figsize=(12, 8))
+                            
+                            # Sort by average distance for better visualization
+                            dist_data = state_fiber.sort_values("Mean Distance", ascending=True).head(20)
+                            
+                            # Create bar chart
+                            sns.barplot(
+                                data=dist_data,
+                                x="Mean Distance",
+                                y="State",
+                                ax=ax_state_dist,
+                                palette="viridis_r"  # Inverse viridis (lower is better)
+                            )
+                            
+                            ax_state_dist.set_title("Average Distance to Fiber by State (km)")
+                            ax_state_dist.set_xlabel("Average Distance (km)")
+                            ax_state_dist.grid(True, axis="x", alpha=0.3)
+                            
+                            # Add value labels
+                            for i, v in enumerate(dist_data["Mean Distance"]):
+                                ax_state_dist.text(v + 0.5, i, f"{v:.1f}", va='center')
+                            
+                            st.pyplot(fig_state_dist)
+                            
+                        else:
+                            st.warning("State and fiber distance data are required for this visualization.")
+                    except Exception as e:
+                        st.error(f"Error creating fiber coverage by state analysis: {e}")
+                
+                elif fiber_viz_type == "Fiber Provider Analysis":
+                    try:
+                        if "Fiber_Provider" in df_dash.columns:
+                            # Count landfills by provider
+                            provider_counts = df_dash["Fiber_Provider"].value_counts().reset_index()
+                            provider_counts.columns = ["Provider", "Count"]
+                            
+                            # Calculate percentage
+                            total = provider_counts["Count"].sum()
+                            provider_counts["Percentage"] = (provider_counts["Count"] / total * 100).round(1)
+                            
+                            # Limit to top providers for visualization
+                            top_n = min(15, len(provider_counts))
+                            top_providers = provider_counts.head(top_n)
+                            
+                            # Create visualization
+                            st.write("### Fiber Provider Analysis")
+                            
+                            # Show the data table
+                            st.dataframe(provider_counts)
+                            
+                            # Create pie chart of top providers
+                            fig_providers, ax_providers = plt.subplots(figsize=(10, 10))
+                            
+                            # Handle "Others" category if we have many providers
+                            if len(provider_counts) > top_n:
+                                # Get the top providers
+                                plot_providers = top_providers.copy()
+                                
+                                # Create "Others" category
+                                others_count = provider_counts["Count"][top_n:].sum()
+                                others_pct = provider_counts["Percentage"][top_n:].sum()
+                                
+                                # Add "Others" to the data
+                                others_row = pd.DataFrame({
+                                    "Provider": ["Others"],
+                                    "Count": [others_count],
+                                    "Percentage": [others_pct]
+                                })
+                                
+                                plot_providers = pd.concat([plot_providers, others_row])
+                            else:
+                                plot_providers = top_providers
+                            
+                            # Create the pie chart
+                            ax_providers.pie(
+                                plot_providers["Count"],
+                                labels=plot_providers["Provider"],
+                                autopct='%1.1f%%',
+                                startangle=90,
+                                shadow=False
+                            )
+                            ax_providers.axis('equal')  # Equal aspect ratio ensures pie is circular
+                            ax_providers.set_title("Landfills by Fiber Provider")
+                            
+                            st.pyplot(fig_providers)
+                            
+                            # Analyze average fiber distance by provider
+                            if "Nearest_Fiber_Distance_km" in df_dash.columns:
+                                st.write("### Fiber Distance by Provider")
+                                
+                                # Calculate statistics by provider
+                                provider_stats = df_dash.groupby("Fiber_Provider").agg({
+                                    "Nearest_Fiber_Distance_km": ["count", "mean", "median", "min", "max"],
+                                }).reset_index()
+                                
+                                # Flatten column names
+                                provider_stats.columns = ["Provider", "Count", "Mean Distance", "Median Distance", 
+                                                        "Min Distance", "Max Distance"]
+                                
+                                # Sort by count (descending)
+                                provider_stats = provider_stats.sort_values("Count", ascending=False)
+                                
+                                # Display top providers
+                                top_provider_stats = provider_stats.head(10)
+                                st.dataframe(top_provider_stats)
+                                
+                                # Create bar chart of average distances
+                                fig_prov_dist, ax_prov_dist = plt.subplots(figsize=(12, 6))
+                                
+                                # Plot only providers with significant count
+                                significant_providers = provider_stats[provider_stats["Count"] >= 5].head(10)
+                                
+                                if not significant_providers.empty:
+                                    sns.barplot(
+                                        data=significant_providers,
+                                        x="Provider",
+                                        y="Mean Distance",
+                                        ax=ax_prov_dist
+                                    )
+                                    
+                                    ax_prov_dist.set_title("Average Distance to Fiber by Provider")
+                                    ax_prov_dist.set_ylabel("Average Distance (km)")
+                                    ax_prov_dist.set_xlabel("Provider")
+                                    plt.xticks(rotation=45, ha="right")
+                                    
+                                    # Add value labels
+                                    for i, v in enumerate(significant_providers["Mean Distance"]):
+                                        ax_prov_dist.text(i, v + 0.2, f"{v:.1f}", ha='center')
+                                    
+                                    plt.tight_layout()
+                                    st.pyplot(fig_prov_dist)
+                                else:
+                                    st.warning("Not enough data points per provider for meaningful visualization.")
+                        else:
+                            st.warning("Fiber provider data not available for analysis.")
+                    except Exception as e:
+                        st.error(f"Error creating fiber provider analysis: {e}")
+                
+                elif fiber_viz_type == "Fiber Speed Analysis":
+                    try:
+                        if "Fiber_Download_Speed" in df_dash.columns:
+                            # Convert to numeric and handle missing values
+                            df_dash["Fiber_Download_Speed"] = pd.to_numeric(df_dash["Fiber_Download_Speed"], errors="coerce")
+                            
+                            # Get valid speed data
+                            speed_data = df_dash.dropna(subset=["Fiber_Download_Speed"])
+                            
+                            if not speed_data.empty:
+                                st.write("### Fiber Speed Distribution")
+                                
+                                # Create histogram of download speeds
+                                fig_speed, ax_speed = plt.subplots(figsize=(10, 6))
+                                
+                                # Create histogram with KDE
+                                sns.histplot(
+                                    speed_data["Fiber_Download_Speed"],
+                                    kde=True,
+                                    bins=30,
+                                    ax=ax_speed
+                                )
+                                
+                                ax_speed.set_title("Distribution of Fiber Download Speeds")
+                                ax_speed.set_xlabel("Download Speed (Mbps)")
+                                ax_speed.set_ylabel("Count")
+                                ax_speed.grid(True, alpha=0.3)
+                                
+                                st.pyplot(fig_speed)
+                                
+                                # Display speed statistics
+                                st.write("### Fiber Speed Statistics")
+                                
+                                # Basic statistics
+                                speed_stats = speed_data["Fiber_Download_Speed"].describe()
+                                st.dataframe(speed_stats)
+                                
+                                # Create speed categories
+                                st.write("### Landfills by Speed Category")
+                                
+                                # Define speed categories
+                                speed_bins = [0, 100, 500, 1000, float('inf')]
+                                speed_labels = ['< 100 Mbps', '100-500 Mbps', '500-1000 Mbps', '1 Gbps+']
+                                
+                                # Create categories
+                                speed_data['Speed Category'] = pd.cut(
+                                    speed_data['Fiber_Download_Speed'], 
+                                    bins=speed_bins, 
+                                    labels=speed_labels
+                                )
+                                
+                                # Count by category
+                                category_counts = speed_data['Speed Category'].value_counts().reset_index()
+                                category_counts.columns = ['Speed Category', 'Count']
+                                
+                                # Calculate percentages
+                                total = category_counts['Count'].sum()
+                                category_counts['Percentage'] = (category_counts['Count'] / total * 100).round(1)
+                                
+                                # Sort by speed category
+                                category_counts = category_counts.sort_values('Speed Category')
+                                
+                                # Display as table
+                                st.dataframe(category_counts)
+                                
+                                # Create pie chart
+                                fig_speed_pie, ax_speed_pie = plt.subplots(figsize=(8, 8))
+                                
+                                # Create the pie chart
+                                ax_speed_pie.pie(
+                                    category_counts["Count"],
+                                    labels=category_counts["Speed Category"],
+                                    autopct='%1.1f%%',
+                                    startangle=90,
+                                    shadow=False,
+                                    colors=plt.cm.viridis(np.linspace(0, 1, len(category_counts)))
+                                )
+                                ax_speed_pie.axis('equal')  # Equal aspect ratio ensures pie is circular
+                                ax_speed_pie.set_title("Landfills by Fiber Speed Category")
+                                
+                                st.pyplot(fig_speed_pie)
+                                
+                                # Analyze relationship between fiber speed and distance
+                                if "Nearest_Fiber_Distance_km" in df_dash.columns:
+                                    st.write("### Fiber Speed vs Distance")
+                                    
+                                    # Create scatter plot
+                                    fig_speed_dist, ax_speed_dist = plt.subplots(figsize=(10, 6))
+                                    
+                                    # Get data for plot
+                                    speed_dist_data = speed_data.dropna(subset=["Nearest_Fiber_Distance_km"])
+                                    
+                                    # Cap distance for better visualization
+                                    max_dist = min(50, speed_dist_data["Nearest_Fiber_Distance_km"].quantile(0.95))
+                                    plot_data = speed_dist_data[speed_dist_data["Nearest_Fiber_Distance_km"] <= max_dist]
+                                    
+                                    # Create scatter plot
+                                    sns.scatterplot(
+                                        data=plot_data,
+                                        x="Nearest_Fiber_Distance_km",
+                                        y="Fiber_Download_Speed",
+                                        hue="Speed Category",
+                                        palette="viridis",
+                                        alpha=0.7,
+                                        ax=ax_speed_dist
+                                    )
+                                    
+                                    # Add regression line
+                                    sns.regplot(
+                                        data=plot_data,
+                                        x="Nearest_Fiber_Distance_km",
+                                        y="Fiber_Download_Speed",
+                                        scatter=False,
+                                        line_kws={"color": "red"},
+                                        ax=ax_speed_dist
+                                    )
+                                    
+                                    # Calculate correlation
+                                    corr = plot_data["Nearest_Fiber_Distance_km"].corr(plot_data["Fiber_Download_Speed"])
+                                    
+                                    ax_speed_dist.set_title("Fiber Speed vs Distance")
+                                    ax_speed_dist.set_xlabel("Distance to Nearest Fiber (km)")
+                                    ax_speed_dist.set_ylabel("Download Speed (Mbps)")
+                                    ax_speed_dist.grid(True, alpha=0.3)
+                                    
+                                    # Add correlation annotation
+                                    ax_speed_dist.annotate(f"Correlation: {corr:.2f}", xy=(0.05, 0.95), xycoords="axes fraction",
+                                                       bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+                                    
+                                    st.pyplot(fig_speed_dist)
+                            else:
+                                st.warning("No fiber speed data available for analysis.")
+                        else:
+                            st.warning("Fiber speed data not available for analysis.")
+                    except Exception as e:
+                        st.error(f"Error creating fiber speed analysis: {e}")
 
 # Run the app
 if __name__ == "__main__":
