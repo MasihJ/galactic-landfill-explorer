@@ -54,6 +54,7 @@ import hashlib
 import folium
 from folium.plugins import MeasureControl, Draw
 
+
 # Set page config first - must be at the very top
 st.set_page_config(
     page_title="Galactic Landfill Explorer", 
@@ -166,6 +167,16 @@ def load_landfills():
                 df["Has_Fiber_Within_5km"] = df["Has_Fiber_Within_5km"].astype(bool)
             if "Has_Fiber_Within_10km" in df.columns:
                 df["Has_Fiber_Within_10km"] = df["Has_Fiber_Within_10km"].astype(bool)
+        
+        # Calculate Methane SCFM and Total mmBTU/day
+        # First calculate methane volume in scfd based on LFG collected and methane percentage
+        df["Methane Volume (scfd)"] = df["LFG Collected (mmscfd)"] * df["Percent Methane"] / 100 * 1e6
+        
+        # Calculate Methane SCFM (standard cubic feet per minute)
+        df["Methane SCFM"] = df["Methane Volume (scfd)"] / (24 * 60)
+        
+        # Calculate Total mmBTU/day of CH4 (using 1011 BTU/scf of methane)
+        df["Total mmBTU/day of CH4"] = df["Methane Volume (scfd)"] * 1011 / 1e6
         
         return df.dropna(subset=["Latitude", "Longitude"])
     except Exception as e:
@@ -304,7 +315,7 @@ def main():
     )
     
     # Sorting options
-    sort_options = ["None", "Percent Methane", "LFG Collected (mmscfd)"]
+    sort_options = ["None", "Percent Methane", "LFG Collected (mmscfd)", "Methane SCFM", "Total mmBTU/day of CH4"]
     if fiber_data_available:
         sort_options.extend(["Nearest_Fiber_Distance_km", "Fiber_Download_Speed", "Fiber_Locations_Within_10km"])
         
@@ -420,11 +431,20 @@ def main():
     # Numeric filters
     st.sidebar.header("Numeric Filters")
     
-    # Original landfill metrics
+    # Original landfill metrics with updated label
     df, _ = optional_slider(df, "Percent Methane", "% Methane", 
                            "Filter landfills based on their methane percentage. Higher values typically indicate better energy potential.")
-    df, _ = optional_slider(df, "LFG Collected (mmscfd)", "LFG Collected", 
+    
+    # Changed label from "LFG Collected" to "mmscfd LFG Collected"
+    df, _ = optional_slider(df, "LFG Collected (mmscfd)", "mmscfd LFG Collected", 
                            "Filter by Landfill Gas collected in million standard cubic feet per day. Higher values indicate greater production capacity.")
+    
+    # Add new calculated filters
+    df, _ = optional_slider(df, "Methane SCFM", "Methane SCFM", 
+                           "Filter by methane flow rate in standard cubic feet per minute. This is calculated from LFG collection and methane percentage.")
+    
+    df, _ = optional_slider(df, "Total mmBTU/day of CH4", "Total mmBTU/day of CH4", 
+                           "Filter by total energy content in million BTU per day. This is calculated using 1011 BTU per standard cubic foot of methane.")
     
     # Only include Distance to City slider if we're calculating it
     if assign_cities and "Distance to City (km)" in df.columns:
@@ -535,18 +555,20 @@ def main():
     calc_df = df.copy()
     calc_df["LFG Collected (mmscfd)"] = pd.to_numeric(calc_df["LFG Collected (mmscfd)"], errors="coerce")
     calc_df["Percent Methane"] = pd.to_numeric(calc_df["Percent Methane"], errors="coerce")
+    calc_df["Methane SCFM"] = pd.to_numeric(calc_df["Methane SCFM"], errors="coerce")
+    calc_df["Total mmBTU/day of CH4"] = pd.to_numeric(calc_df["Total mmBTU/day of CH4"], errors="coerce")
 
     # Get total LFG collected
     total_lfg = calc_df["LFG Collected (mmscfd)"].sum()
 
-    # Fill missing methane percentages with a default value (50%)
-    calc_df["Percent Methane"].fillna(50, inplace=True)
-
-    # Calculate methane volume for each landfill
-    calc_df["Methane Volume (scfd)"] = calc_df["LFG Collected (mmscfd)"] * (calc_df["Percent Methane"]/100) * 1e6
-
     # Calculate total methane collected (in mmscfd for consistency)
     total_methane = (calc_df["Methane Volume (scfd)"].sum() / 1e6)
+    
+    # Calculate total methane SCFM
+    total_methane_scfm = calc_df["Methane SCFM"].sum()
+    
+    # Calculate total mmBTU/day
+    total_mmbtu = calc_df["Total mmBTU/day of CH4"].sum()
 
     # Energy content of methane (BTU to kWh conversion)
     energy_content_kwh = 1011 * 0.000293071  # kWh per scf of methane (≈ 0.296 kWh/scf)
@@ -569,8 +591,10 @@ def main():
     with col1:
         st.metric("Total Landfills", f"{len(df):,}")
         st.metric("Total LFG Collected", f"{total_lfg:.2f} mmscfd")
+        st.metric("Total Methane SCFM", f"{total_methane_scfm:.2f}")
     with col2:
         st.metric("Total Methane Collected", f"{total_methane:.2f} mmscfd")
+        st.metric("Total mmBTU/day of CH4", f"{total_mmbtu:,.0f}")
         st.metric("Daily Revenue", f"${revenue_day:,.0f}")
     with col3:
         st.metric("Annual Revenue", f"${annual_revenue:,.0f}")
@@ -644,7 +668,7 @@ def main():
     # Map configuration
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        color_options = ["Percent Methane", "LFG Collected (mmscfd)"]
+        color_options = ["Percent Methane", "LFG Collected (mmscfd)", "Methane SCFM", "Total mmBTU/day of CH4"]
         
         # Add distance to city option if available
         if assign_cities and "Distance to City (km)" in df.columns:
@@ -878,12 +902,47 @@ def main():
                     if pd.isna(lat) or pd.isna(lon):
                         continue
                     
-                    # Create popup content
+                    # Update popup content with requested fields
                     popup_parts = [
                         f"<b>{row.get('Landfill Name', 'Unnamed')}</b>"
                     ]
 
-                    # Add location information
+                    # Add landfill ID if available
+                    if 'Landfill ID' in row and not pd.isna(row.get('Landfill ID')):
+                        popup_parts.append(f"<b>ID:</b> {row.get('Landfill ID')}")
+                    
+                    # Add latitude and longitude
+                    popup_parts.append(f"<b>Lat:</b> {lat:.4f}, <b>Long:</b> {lon:.4f}")
+                    
+                    # Add ownership type
+                    if 'Ownership Type' in row and not pd.isna(row.get('Ownership Type')):
+                        popup_parts.append(f"<b>Ownership:</b> {row.get('Ownership Type')}")
+                    
+                    # Add current landfill status
+                    if 'Current Landfill Status' in row and not pd.isna(row.get('Current Landfill Status')):
+                        popup_parts.append(f"<b>Status:</b> {row.get('Current Landfill Status')}")
+                    
+                    # Add methane percentage
+                    if 'Percent Methane' in row and not pd.isna(row.get('Percent Methane')):
+                        popup_parts.append(f"<b>Methane %:</b> {float(row.get('Percent Methane')):.1f}%")
+                    
+                    # Add LFG collected
+                    if 'LFG Collected (mmscfd)' in row and not pd.isna(row.get('LFG Collected (mmscfd)')):
+                        popup_parts.append(f"<b>LFG Collected:</b> {float(row.get('LFG Collected (mmscfd)')):.2f} mmscfd")
+                    
+                    # Add Methane SCFM
+                    if 'Methane SCFM' in row and not pd.isna(row.get('Methane SCFM')):
+                        popup_parts.append(f"<b>Methane SCFM:</b> {float(row.get('Methane SCFM')):.2f}")
+                    
+                    # Add Total mmBTU/day of CH4
+                    if 'Total mmBTU/day of CH4' in row and not pd.isna(row.get('Total mmBTU/day of CH4')):
+                        popup_parts.append(f"<b>Total mmBTU/day:</b> {float(row.get('Total mmBTU/day of CH4')):.1f}")
+                    
+                    # Add closure year
+                    if 'Landfill Closure Year' in row and not pd.isna(row.get('Landfill Closure Year')):
+                        popup_parts.append(f"<b>Closure Year:</b> {int(row.get('Landfill Closure Year'))}")
+
+                    # Add location information as before
                     address_parts = []
                     if 'Address' in row and not pd.isna(row.get('Address')):
                         address_parts.append(f"{row.get('Address')}")
@@ -894,13 +953,13 @@ def main():
 
                     # Join address parts with commas
                     if address_parts:
-                        popup_parts.append(", ".join(address_parts))
+                        popup_parts.append(f"<b>Location:</b> {', '.join(address_parts)}")
 
-                    # Add value if available
+                    # Add value if available (keeping this as it might be relevant)
                     if color_by in df_map.columns and 'val' in row:
                         val = row['val']
                         if not pd.isna(val):
-                            popup_parts.append(f"{color_by}: {val:.2f}")
+                            popup_parts.append(f"<b>{color_by}:</b> {val:.2f}")
                     
                     # Add fiber information if available
                     if fiber_data_available:
@@ -1119,68 +1178,363 @@ def main():
                         # Display results
                         st.success(f"Nearest landfill: {nearest.get('Landfill Name', 'Unnamed')}")
                         
-                        # Show details
-                        result_cols = ["Landfill Name", "City", "State", "Percent Methane", 
-                                     "LFG Collected (mmscfd)"]
-                        if "Distance to City (km)" in nearest:
-                            result_cols.append("Distance to City (km)")
+                        # Show all available data for the landfill
+                        st.write("### Complete Landfill Data")
+                        # Display all columns, replace NaN with None
+                        st.dataframe(pd.DataFrame([nearest]).fillna("None"))
                         
-                        # Add fiber information if available
-                        if fiber_data_available and "Nearest_Fiber_Distance_km" in nearest:
-                            result_cols.append("Nearest_Fiber_Distance_km")
+                        # Add calculations table with updated metrics
+                        st.write("### Landfill Calculations")
+                        try:
+                            # Extract key metrics
+                            lfg_collected_mmscfd = pd.to_numeric(nearest.get("LFG Collected (mmscfd)"), errors="coerce")
+                            percent_methane = pd.to_numeric(nearest.get("Percent Methane"), errors="coerce")
                             
-                        st.dataframe(nearest[result_cols])
-                        
-                        # Create mini map for nearest landfill
-                        mini_map = folium.Map(
-                            location=[float(nearest["Latitude"]), float(nearest["Longitude"])], 
-                            zoom_start=10
-                        )
-                        
-                        # Add landfill marker
-                        folium.Marker(
-                            [float(nearest["Latitude"]), float(nearest["Longitude"])],
-                            popup=nearest.get("Landfill Name", "Unnamed"),
-                            icon=folium.Icon(color="red")
-                        ).add_to(mini_map)
-                        
-                        # Add user location marker
-                        folium.Marker(
-                            [lat, lon],
-                            popup="Your Location",
-                            icon=folium.Icon(color="blue", icon="info-sign")
-                        ).add_to(mini_map)
-                        
-                        # Add fiber point if available
-                        if fiber_data_available and "Nearest_Fiber_Lat" in nearest and "Nearest_Fiber_Lon" in nearest:
-                            fiber_lat = nearest.get("Nearest_Fiber_Lat")
-                            fiber_lon = nearest.get("Nearest_Fiber_Lon")
+                            # Default to 50% methane if not available
+                            if pd.isna(percent_methane):
+                                percent_methane = 50
+                                st.info("Percent Methane value not available, using default value of 50%.")
                             
-                            if not pd.isna(fiber_lat) and not pd.isna(fiber_lon):
-                                folium.Marker(
-                                    [float(fiber_lat), float(fiber_lon)],
-                                    popup="Nearest Fiber Infrastructure",
-                                    icon=folium.Icon(color="green", icon="signal", prefix="fa")
-                                ).add_to(mini_map)
-                                
-                                # Draw line between landfill and fiber
-                                locations = [
-                                    [float(nearest["Latitude"]), float(nearest["Longitude"])],
-                                    [float(fiber_lat), float(fiber_lon)]
-                                ]
-                                folium.PolyLine(
-                                    locations=locations,
-                                    color="green",
-                                    weight=2,
-                                    opacity=0.7,
-                                    dash_array="5"
-                                ).add_to(mini_map)
-                        
-                        # Show mini map with unique key
-                        folium_static(mini_map, width=700, height=400, key="nearest_landfill_map")
+                            # Calculate total flow in SCFM
+                            total_scfm = lfg_collected_mmscfd * 1e6 / (24 * 60) if not pd.isna(lfg_collected_mmscfd) else None
+                            
+                            # Calculate methane volume
+                            methane_volume_scfd = lfg_collected_mmscfd * (percent_methane/100) * 1e6 if not pd.isna(lfg_collected_mmscfd) else None
+                            
+                            # Calculate methane SCFM
+                            methane_scfm = methane_volume_scfd / (24 * 60) if methane_volume_scfd is not None else None
+                            
+                            # Calculate Total mmBTU/day of CH4
+                            total_mmbtu_day = methane_volume_scfd * 1011 / 1e6 if methane_volume_scfd is not None else None
+                            
+                            # Energy content of methane (BTU to kWh conversion)
+                            energy_content_kwh = 1011 * 0.000293071  # kWh per scf of methane (≈ 0.296 kWh/scf)
+                            
+                            # Calculate energy potential
+                            thermal_energy_potential_kwh = methane_volume_scfd * energy_content_kwh if methane_volume_scfd is not None else None
+                            
+                            # Efficiency settings from main app
+                            efficiency = 0.40  # Default to 40% efficiency
+                            elec_price = 0.06  # Default to $0.06/kWh
+                            days_per_year = 365  # Default to full year
+                            years = 20  # Default to 20 year project lifetime
+                            
+                            # Get values from session state if they exist
+                            if "efficiency" in st.session_state:
+                                efficiency = st.session_state.efficiency / 100
+                            if "elec_price" in st.session_state:
+                                elec_price = st.session_state.elec_price
+                            if "days_per_year" in st.session_state:
+                                days_per_year = st.session_state.days_per_year
+                            if "years" in st.session_state:
+                                years = st.session_state.years
+                            
+                            # Calculate energy output with efficiency
+                            electrical_energy_output_kwh = thermal_energy_potential_kwh * efficiency if thermal_energy_potential_kwh is not None else None
+                            electrical_energy_output_mwh = electrical_energy_output_kwh / 1000 if electrical_energy_output_kwh is not None else None
+                            
+                            # Calculate revenue
+                            revenue_day = electrical_energy_output_kwh * elec_price if electrical_energy_output_kwh is not None else None
+                            annual_revenue = revenue_day * days_per_year if revenue_day is not None else None
+                            lifetime_revenue = annual_revenue * years if annual_revenue is not None else None
+                            
+                            # Create a dataframe for calculations
+                            calc_df = pd.DataFrame([
+                                {"Metric": "LFG Collected", "Value": f"{lfg_collected_mmscfd:.2f} mmscfd" if not pd.isna(lfg_collected_mmscfd) else "Not available"},
+                                {"Metric": "Total Flow Rate", "Value": f"{total_scfm:,.0f} SCFM" if total_scfm is not None else "Not available"},
+                                {"Metric": "Percent Methane", "Value": f"{percent_methane:.1f}%" if not pd.isna(percent_methane) else "Not available"},
+                                {"Metric": "Methane Volume", "Value": f"{methane_volume_scfd/1e6:.2f} mmscfd" if methane_volume_scfd is not None else "Not available"},
+                                {"Metric": "Methane Flow Rate", "Value": f"{methane_scfm:,.0f} SCFM" if methane_scfm is not None else "Not available"},
+                                {"Metric": "Total mmBTU/day of CH4", "Value": f"{total_mmbtu_day:,.0f}" if total_mmbtu_day is not None else "Not available"},
+                                {"Metric": "Thermal Energy Potential", "Value": f"{thermal_energy_potential_kwh/1000:.2f} MWh/day" if thermal_energy_potential_kwh is not None else "Not available"},
+                                {"Metric": "Electrical Energy Output (with efficiency)", "Value": f"{electrical_energy_output_mwh:.2f} MWh/day" if electrical_energy_output_mwh is not None else "Not available"},
+                                {"Metric": "Daily Revenue", "Value": f"${revenue_day:,.2f}" if revenue_day is not None else "Not available"},
+                                {"Metric": "Annual Revenue", "Value": f"${annual_revenue:,.2f}" if annual_revenue is not None else "Not available"},
+                                {"Metric": "Lifetime Revenue ({years} years)", "Value": f"${lifetime_revenue:,.2f}" if lifetime_revenue is not None else "Not available"},
+                                {"Metric": "Annual Revenue", "Value": f"${annual_revenue:,.2f}" if annual_revenue is not None else "Not available"},
+                                {"Metric": "Lifetime Revenue ({years} years)", "Value": f"${lifetime_revenue:,.2f}" if lifetime_revenue is not None else "Not available"}
+                            ])
+                            
+                            # Display calculations
+                            st.dataframe(calc_df, hide_index=True)
+                            
+                            # Display calculation parameters
+                            st.write("### Calculation Parameters")
+                            param_df = pd.DataFrame([
+                                {"Parameter": "Electrical Efficiency", "Value": f"{efficiency*100:.1f}%"},
+                                {"Parameter": "Electricity Price", "Value": f"${elec_price:.2f}/kWh"},
+                                {"Parameter": "Operational Days/year", "Value": f"{days_per_year} days"},
+                                {"Parameter": "Project Lifetime", "Value": f"{years} years"}
+                            ])
+                            st.dataframe(param_df, hide_index=True)
+                            
+                        except Exception as e:
+                            st.error(f"Error calculating landfill metrics: {e}")
                         
                 except Exception as e:
                     st.error(f"Error finding nearest landfill: {e}")
+            
+            # Add divider between original functionality and new search features
+            st.markdown("---")
+            st.subheader("Advanced Landfill Search")
+
+            # Create tabs for different search types
+            search_tab1, search_tab2 = st.tabs(["Search by Name/ID", "Custom SQL Query"])
+
+            with search_tab1:
+                # Text search for landfill name or ID
+                st.write("Search for landfills by name or ID:")
+                
+                # Create search input
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    search_text = st.text_input("Enter landfill name or ID", key="search_text")
+                with col2:
+                    search_type = st.selectbox("Search field", ["Name", "ID", "Both"], key="search_type")
+                
+                # Add search button
+                if st.button("Search", key="name_id_search"):
+                    if search_text:
+                        try:
+                            # Create search mask based on selection
+                            if search_type == "Name":
+                                mask = df_dash["Landfill Name"].str.contains(search_text, case=False, na=False)
+                            elif search_type == "ID":
+                                # Convert IDs to string for searching if needed
+                                if "Landfill ID" in df_dash.columns:
+                                    mask = df_dash["Landfill ID"].astype(str).str.contains(search_text, case=False, na=False)
+                                else:
+                                    st.warning("Landfill ID column not found in data.")
+                                    mask = pd.Series(False, index=df_dash.index)
+                            else:  # Both
+                                name_mask = df_dash["Landfill Name"].str.contains(search_text, case=False, na=False)
+                                id_mask = pd.Series(False, index=df_dash.index)
+                                if "Landfill ID" in df_dash.columns:
+                                    id_mask = df_dash["Landfill ID"].astype(str).str.contains(search_text, case=False, na=False)
+                                mask = name_mask | id_mask
+                            
+                            # Filter data
+                            search_results = df_dash[mask]
+                            
+                            if len(search_results) > 0:
+                                st.success(f"Found {len(search_results)} matching landfill(s).")
+                                
+                                # Display full data table with all columns
+                                st.write("### Complete Landfill Data")
+                                st.dataframe(search_results.fillna("None"))
+                                
+                                # Add calculations table for single landfill result with updated metrics
+                                if len(search_results) == 1:
+                                    st.write("### Landfill Calculations")
+                                    try:
+                                        # Get the single landfill result
+                                        landfill = search_results.iloc[0]
+                                        
+                                        # Extract key metrics
+                                        lfg_collected_mmscfd = pd.to_numeric(landfill.get("LFG Collected (mmscfd)"), errors="coerce")
+                                        percent_methane = pd.to_numeric(landfill.get("Percent Methane"), errors="coerce")
+                                        
+                                        # Default to 50% methane if not available
+                                        if pd.isna(percent_methane):
+                                            percent_methane = 50
+                                            st.info("Percent Methane value not available, using default value of 50%.")
+                                        
+                                        # Calculate total flow in SCFM
+                                        total_scfm = lfg_collected_mmscfd * 1e6 / (24 * 60) if not pd.isna(lfg_collected_mmscfd) else None
+                                        
+                                        # Calculate methane volume
+                                        methane_volume_scfd = lfg_collected_mmscfd * (percent_methane/100) * 1e6 if not pd.isna(lfg_collected_mmscfd) else None
+                                        
+                                        # Calculate methane SCFM
+                                        methane_scfm = methane_volume_scfd / (24 * 60) if methane_volume_scfd is not None else None
+                                        
+                                        # Energy content of methane (BTU to kWh conversion)
+                                        energy_content_kwh = 1011 * 0.000293071  # kWh per scf of methane (≈ 0.296 kWh/scf)
+                                        
+                                        # Calculate energy potential
+                                        thermal_energy_potential_kwh = methane_volume_scfd * energy_content_kwh if methane_volume_scfd is not None else None
+                                        
+                                        # Efficiency settings from main app
+                                        efficiency = 0.40  # Default to 40% efficiency
+                                        elec_price = 0.06  # Default to $0.06/kWh
+                                        days_per_year = 365  # Default to full year
+                                        years = 20  # Default to 20 year project lifetime
+                                        
+                                        # Get values from session state if they exist
+                                        if "efficiency" in st.session_state:
+                                            efficiency = st.session_state.efficiency / 100
+                                        if "elec_price" in st.session_state:
+                                            elec_price = st.session_state.elec_price
+                                        if "days_per_year" in st.session_state:
+                                            days_per_year = st.session_state.days_per_year
+                                        if "years" in st.session_state:
+                                            years = st.session_state.years
+                                        
+                                        # Calculate energy output with efficiency
+                                        electrical_energy_output_kwh = thermal_energy_potential_kwh * efficiency if thermal_energy_potential_kwh is not None else None
+                                        electrical_energy_output_mwh = electrical_energy_output_kwh / 1000 if electrical_energy_output_kwh is not None else None
+                                        
+                                        # Calculate revenue
+                                        revenue_day = electrical_energy_output_kwh * elec_price if electrical_energy_output_kwh is not None else None
+                                        annual_revenue = revenue_day * days_per_year if revenue_day is not None else None
+                                        lifetime_revenue = annual_revenue * years if annual_revenue is not None else None
+                                        
+                                        # Create a dataframe for calculations
+                                        calc_df = pd.DataFrame([
+                                            {"Metric": "LFG Collected", "Value": f"{lfg_collected_mmscfd:.2f} mmscfd" if not pd.isna(lfg_collected_mmscfd) else "Not available"},
+                                            {"Metric": "Total Flow Rate", "Value": f"{total_scfm:,.0f} SCFM" if total_scfm is not None else "Not available"},
+                                            {"Metric": "Percent Methane", "Value": f"{percent_methane:.1f}%" if not pd.isna(percent_methane) else "Not available"},
+                                            {"Metric": "Methane Volume", "Value": f"{methane_volume_scfd/1e6:.2f} mmscfd" if methane_volume_scfd is not None else "Not available"},
+                                            {"Metric": "Methane Flow Rate", "Value": f"{methane_scfm:,.0f} SCFM" if methane_scfm is not None else "Not available"},
+                                            {"Metric": "Thermal Energy Potential", "Value": f"{thermal_energy_potential_kwh/1000:.2f} MWh/day" if thermal_energy_potential_kwh is not None else "Not available"},
+                                            {"Metric": "Electrical Energy Output (with efficiency)", "Value": f"{electrical_energy_output_mwh:.2f} MWh/day" if electrical_energy_output_mwh is not None else "Not available"},
+                                            {"Metric": "Daily Revenue", "Value": f"${revenue_day:,.2f}" if revenue_day is not None else "Not available"},
+                                            {"Metric": "Annual Revenue", "Value": f"${annual_revenue:,.2f}" if annual_revenue is not None else "Not available"},
+                                            {"Metric": "Lifetime Revenue ({years} years)", "Value": f"${lifetime_revenue:,.2f}" if lifetime_revenue is not None else "Not available"}
+                                        ])
+                                        
+                                        # Display calculations
+                                        st.dataframe(calc_df, hide_index=True)
+                                        
+                                        # Display calculation parameters
+                                        st.write("### Calculation Parameters")
+                                        param_df = pd.DataFrame([
+                                            {"Parameter": "Electrical Efficiency", "Value": f"{efficiency*100:.1f}%"},
+                                            {"Parameter": "Electricity Price", "Value": f"${elec_price:.2f}/kWh"},
+                                            {"Parameter": "Operational Days/year", "Value": f"{days_per_year} days"},
+                                            {"Parameter": "Project Lifetime", "Value": f"{years} years"}
+                                        ])
+                                        st.dataframe(param_df, hide_index=True)
+                                        
+                                    except Exception as e:
+                                        st.error(f"Error calculating landfill metrics: {e}")
+                                
+                            else:
+                                st.warning(f"No landfills found matching '{search_text}'.")
+                        except Exception as e:
+                            st.error(f"Error during search: {e}")
+
+            with search_tab2:
+                st.write("Advanced search with SQL-like queries:")
+                st.info("Example: `Percent Methane > 50 and State == 'CA'` or `LFG Collected (mmscfd) > 5`")
+                
+                # Create query input
+                query_text = st.text_area("Enter query expression", height=100, key="sql_query")
+                
+                # Execute query button
+                if st.button("Execute Query", key="execute_query"):
+                    if query_text:
+                        try:
+                            # Apply query to dataframe
+                            query_results = df_dash.query(query_text)
+                            
+                            if len(query_results) > 0:
+                                st.success(f"Query returned {len(query_results)} landfills.")
+                                
+                                # Display full data table with all columns
+                                st.write("### Query Results")
+                                st.dataframe(query_results.fillna("None"))
+                                
+                                # Offer to download results
+                                csv_data = query_results.to_csv(index=False)
+                                st.download_button(
+                                    label="Download Results",
+                                    data=csv_data,
+                                    file_name="landfill_query_results.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # Add calculations table for single query result with updated metrics
+                                if len(query_results) == 1:
+                                    st.write("### Landfill Calculations")
+                                    try:
+                                        # Get the single landfill result
+                                        landfill = query_results.iloc[0]
+                                        
+                                        # Extract key metrics
+                                        lfg_collected_mmscfd = pd.to_numeric(landfill.get("LFG Collected (mmscfd)"), errors="coerce")
+                                        percent_methane = pd.to_numeric(landfill.get("Percent Methane"), errors="coerce")
+                                        
+                                        # Default to 50% methane if not available
+                                        if pd.isna(percent_methane):
+                                            percent_methane = 50
+                                            st.info("Percent Methane value not available, using default value of 50%.")
+                                        
+                                        # Calculate total flow in SCFM
+                                        total_scfm = lfg_collected_mmscfd * 1e6 / (24 * 60) if not pd.isna(lfg_collected_mmscfd) else None
+                                        
+                                        # Calculate methane volume
+                                        methane_volume_scfd = lfg_collected_mmscfd * (percent_methane/100) * 1e6 if not pd.isna(lfg_collected_mmscfd) else None
+                                        
+                                        # Calculate methane SCFM
+                                        methane_scfm = methane_volume_scfd / (24 * 60) if methane_volume_scfd is not None else None
+                                        
+                                        # Energy content of methane (BTU to kWh conversion)
+                                        energy_content_kwh = 1011 * 0.000293071  # kWh per scf of methane (≈ 0.296 kWh/scf)
+                                        
+                                        # Calculate energy potential
+                                        thermal_energy_potential_kwh = methane_volume_scfd * energy_content_kwh if methane_volume_scfd is not None else None
+                                        
+                                        # Efficiency settings from main app
+                                        efficiency = 0.40  # Default to 40% efficiency
+                                        elec_price = 0.06  # Default to $0.06/kWh
+                                        days_per_year = 365  # Default to full year
+                                        years = 20  # Default to 20 year project lifetime
+                                        
+                                        # Get values from session state if they exist
+                                        if "efficiency" in st.session_state:
+                                            efficiency = st.session_state.efficiency / 100
+                                        if "elec_price" in st.session_state:
+                                            elec_price = st.session_state.elec_price
+                                        if "days_per_year" in st.session_state:
+                                            days_per_year = st.session_state.days_per_year
+                                        if "years" in st.session_state:
+                                            years = st.session_state.years
+                                        
+                                        # Calculate energy output with efficiency
+                                        electrical_energy_output_kwh = thermal_energy_potential_kwh * efficiency if thermal_energy_potential_kwh is not None else None
+                                        electrical_energy_output_mwh = electrical_energy_output_kwh / 1000 if electrical_energy_output_kwh is not None else None
+                                        
+                                        # Calculate revenue
+                                        revenue_day = electrical_energy_output_kwh * elec_price if electrical_energy_output_kwh is not None else None
+                                        annual_revenue = revenue_day * days_per_year if revenue_day is not None else None
+                                        lifetime_revenue = annual_revenue * years if annual_revenue is not None else None
+                                        
+                                        # Create a dataframe for calculations
+                                        calc_df = pd.DataFrame([
+                                            {"Metric": "LFG Collected", "Value": f"{lfg_collected_mmscfd:.2f} mmscfd" if not pd.isna(lfg_collected_mmscfd) else "Not available"},
+                                            {"Metric": "Total Flow Rate", "Value": f"{total_scfm:,.0f} SCFM" if total_scfm is not None else "Not available"},
+                                            {"Metric": "Percent Methane", "Value": f"{percent_methane:.1f}%" if not pd.isna(percent_methane) else "Not available"},
+                                            {"Metric": "Methane Volume", "Value": f"{methane_volume_scfd/1e6:.2f} mmscfd" if methane_volume_scfd is not None else "Not available"},
+                                            {"Metric": "Methane Flow Rate", "Value": f"{methane_scfm:,.0f} SCFM" if methane_scfm is not None else "Not available"},
+                                            {"Metric": "Thermal Energy Potential", "Value": f"{thermal_energy_potential_kwh/1000:.2f} MWh/day" if thermal_energy_potential_kwh is not None else "Not available"},
+                                            {"Metric": "Electrical Energy Output (with efficiency)", "Value": f"{electrical_energy_output_mwh:.2f} MWh/day" if electrical_energy_output_mwh is not None else "Not available"},
+                                            {"Metric": "Daily Revenue", "Value": f"${revenue_day:,.2f}" if revenue_day is not None else "Not available"},
+                                            {"Metric": "Annual Revenue", "Value": f"${annual_revenue:,.2f}" if annual_revenue is not None else "Not available"},
+                                            {"Metric": "Lifetime Revenue ({years} years)", "Value": f"${lifetime_revenue:,.2f}" if lifetime_revenue is not None else "Not available"}
+                                        ])
+                                        
+                                        # Display calculations
+                                        st.dataframe(calc_df, hide_index=True)
+                                        
+                                        # Display calculation parameters
+                                        st.write("### Calculation Parameters")
+                                        param_df = pd.DataFrame([
+                                            {"Parameter": "Electrical Efficiency", "Value": f"{efficiency*100:.1f}%"},
+                                            {"Parameter": "Electricity Price", "Value": f"${elec_price:.2f}/kWh"},
+                                            {"Parameter": "Operational Days/year", "Value": f"{days_per_year} days"},
+                                            {"Parameter": "Project Lifetime", "Value": f"{years} years"}
+                                        ])
+                                        st.dataframe(param_df, hide_index=True)
+                                        
+                                    except Exception as e:
+                                        st.error(f"Error calculating landfill metrics: {e}")
+                                    
+                            else:
+                                st.warning("No landfills match the query criteria.")
+                        except Exception as e:
+                            st.error(f"Error executing query: {e}\n\nPlease check your syntax and try again.")
+                            st.info("Common issues: Remember to put text values in quotes and use == for equality.")
         
         with tab3:
             st.subheader("Core Visualizations")
@@ -1306,22 +1660,23 @@ def main():
                 except Exception as e:
                     st.error(f"Error displaying top 10 tables: {e}")
         
-        # NEW TAB FOR ADVANCED VISUALIZATIONS
         with tab4:
             st.subheader("Advanced Visualizations")
-            advanced_viz_type = st.selectbox(
+            viz_type = st.selectbox(
                 "Select Advanced Visualization", 
                 ["Waste in Place vs LFG Collected", "Landfill Depth vs LFG Collected", "Annual Waste Acceptance Year Histogram", 
                  "Multiple Factors Analysis"],
                 key="advanced_viz_type"
             )
             
-            if advanced_viz_type == "Waste in Place vs LFG Collected":
+            if viz_type == "Waste in Place vs LFG Collected":
                 try:
                     fig4, ax4 = plt.subplots(figsize=(10, 6))
                     scatter_data4 = df_dash.dropna(subset=["Waste in Place (tons)", "LFG Collected (mmscfd)"])
                     
                     if not scatter_data4.empty:
+                        # Create a copy to prevent warning
+                        scatter_data4 = scatter_data4.copy()
                         # Convert to millions of tons for better readability
                         scatter_data4["Waste in Place (millions of tons)"] = scatter_data4["Waste in Place (tons)"] / 1e6
                         
@@ -1367,359 +1722,7 @@ def main():
                         st.pyplot(fig4)
                         st.warning("Not enough data with both Waste in Place and LFG Collected values to create visualization.")
                 except Exception as e:
-                    st.error(f"Error creating Waste vs LFG plot: {e}")
-            
-            elif advanced_viz_type == "Landfill Depth vs LFG Collected":
-                try:
-                    fig5, ax5 = plt.subplots(figsize=(10, 6))
-                    scatter_data5 = df_dash.dropna(subset=["Current Landfill Depth (feet)", "LFG Collected (mmscfd)"])
-                    
-                    if not scatter_data5.empty:
-                        # Create scatter plot with hue by methane percent if available
-                        if "Percent Methane" in scatter_data5.columns:
-                            scatter_data5["Percent Methane"] = pd.to_numeric(scatter_data5["Percent Methane"], errors="coerce")
-                            valid_data = scatter_data5.dropna(subset=["Percent Methane"])
-                            
-                            if not valid_data.empty:
-                                scatter = sns.scatterplot(
-                                    data=valid_data,
-                                    x="Current Landfill Depth (feet)",
-                                    y="LFG Collected (mmscfd)",
-                                    hue="Percent Methane",
-                                    palette="viridis",
-                                    alpha=0.7,
-                                    ax=ax5
-                                )
-                                # Add colorbar legend
-                                norm = plt.Normalize(valid_data["Percent Methane"].min(), valid_data["Percent Methane"].max())
-                                sm = plt.cm.ScalarMappable(cmap="viridis", norm=norm)
-                                sm.set_array([])
-                                cbar = fig5.colorbar(sm, ax=ax5)
-                                cbar.set_label("Percent Methane")
-                                
-                                # Remove the default legend
-                                if ax5.get_legend():
-                                    ax5.get_legend().remove()
-                            else:
-                                # Fallback to simple scatter plot if no methane data
-                                sns.scatterplot(
-                                    data=scatter_data5,
-                                    x="Current Landfill Depth (feet)",
-                                    y="LFG Collected (mmscfd)",
-                                    ax=ax5
-                                )
-                        else:
-                            # Default scatter plot
-                            sns.scatterplot(
-                                data=scatter_data5,
-                                x="Current Landfill Depth (feet)",
-                                y="LFG Collected (mmscfd)",
-                                ax=ax5
-                            )
-                        
-                        # Add regression line
-                        sns.regplot(
-                            data=scatter_data5,
-                            x="Current Landfill Depth (feet)",
-                            y="LFG Collected (mmscfd)",
-                            scatter=False,
-                            line_kws={"color": "red"},
-                            ax=ax5
-                        )
-                        
-                        ax5.set_title("Landfill Depth vs LFG Collected")
-                        ax5.set_xlabel("Current Landfill Depth (feet)")
-                        ax5.set_ylabel("LFG Collected (mmscfd)")
-                        ax5.grid(True, alpha=0.3)
-                        
-                        # Calculate correlation coefficient
-                        corr = scatter_data5["Current Landfill Depth (feet)"].corr(scatter_data5["LFG Collected (mmscfd)"])
-                        ax5.annotate(f"Correlation: {corr:.2f}", xy=(0.05, 0.95), xycoords="axes fraction", 
-                                   bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
-                        
-                        st.pyplot(fig5)
-                        
-                        # Additional depth analysis
-                        st.write("### Depth Analysis")
-                        
-                        # Create depth bins
-                        bins = [0, 50, 100, 150, 200, 250, 300, float('inf')]
-                        labels = ['0-50', '51-100', '101-150', '151-200', '201-250', '251-300', '300+']
-                        scatter_data5['Depth Range (feet)'] = pd.cut(scatter_data5['Current Landfill Depth (feet)'], bins=bins, labels=labels)
-                        
-                        # Group by depth range
-                        depth_analysis = scatter_data5.groupby('Depth Range (feet)').agg({
-                            'LFG Collected (mmscfd)': ['count', 'mean', 'std', 'min', 'max'],
-                            'Current Landfill Depth (feet)': ['mean']
-                        }).reset_index()
-                        
-                        # Format for display
-                        depth_analysis.columns = ['Depth Range (feet)', 'Count', 'Mean LFG', 'Std Dev LFG', 'Min LFG', 'Max LFG', 'Mean Depth']
-                        depth_analysis = depth_analysis.sort_values('Mean Depth')
-                        
-                        # Show the table
-                        st.dataframe(depth_analysis)
-                        
-                        # Create a bar chart of LFG by depth range
-                        fig_bar, ax_bar = plt.subplots(figsize=(10, 5))
-                        bar_data = depth_analysis[depth_analysis['Count'] > 0]  # Only plot where we have data
-                        bar_data.plot(kind='bar', x='Depth Range (feet)', y='Mean LFG', yerr='Std Dev LFG', ax=ax_bar, color='skyblue')
-                        ax_bar.set_title('Average LFG Collected by Landfill Depth Range')
-                        ax_bar.set_ylabel('LFG Collected (mmscfd)')
-                        ax_bar.set_xlabel('Depth Range (feet)')
-                        plt.xticks(rotation=45)
-                        st.pyplot(fig_bar)
-                        
-                    else:
-                        ax5.text(0.5, 0.5, "Insufficient data for plot", 
-                                ha='center', va='center', fontsize=12)
-                        st.pyplot(fig5)
-                        st.warning("Not enough data with both Landfill Depth and LFG Collected values to create visualization.")
-                except Exception as e:
-                    st.error(f"Error creating Depth vs LFG plot: {e}")
-            
-            elif advanced_viz_type == "Annual Waste Acceptance Year Histogram":
-                try:
-                    # Convert to numeric and handle missing values
-                    df_dash["Annual Waste Acceptance Year"] = pd.to_numeric(
-                        df_dash["Annual Waste Acceptance Year"], errors="coerce"
-                    )
-                    
-                    waste_data = df_dash.dropna(subset=["Annual Waste Acceptance Year"])
-                    
-                    if not waste_data.empty:
-                        # Create figure with histogram
-                        fig6, ax6 = plt.subplots(figsize=(12, 6))
-                        
-                        # Histogram of Annual Waste Acceptance Year
-                        sns.histplot(
-                            data=waste_data,
-                            x="Annual Waste Acceptance Year",
-                            kde=True,
-                            bins=20,
-                            ax=ax6
-                        )
-                        ax6.set_title("Annual Waste Acceptance Year Distribution")
-                        ax6.set_xlabel("Year")
-                        ax6.set_ylabel("Count")
-                        ax6.grid(True, alpha=0.3)
-                        
-                        # Set x-axis to show years clearly
-                        min_year = int(waste_data["Annual Waste Acceptance Year"].min())
-                        max_year = int(waste_data["Annual Waste Acceptance Year"].max())
-                        ax6.set_xticks(range(min_year, max_year + 1, 2))  # Show every other year
-                        plt.xticks(rotation=45)
-                        
-                        plt.tight_layout()
-                        st.pyplot(fig6)
-                        
-                        # Display summary statistics
-                        st.write("### Annual Waste Acceptance Year Statistics")
-                        
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.write("**Basic Statistics**")
-                            waste_stats = waste_data["Annual Waste Acceptance Year"].describe().astype(int)
-                            st.dataframe(waste_stats)
-                        
-                        with col2:
-                            # Calculate percentiles
-                            percentiles = [10, 25, 50, 75, 90, 95, 99]
-                            percentile_values = [int(waste_data["Annual Waste Acceptance Year"].quantile(p/100)) for p in percentiles]
-                            
-                            st.write("**Percentiles**")
-                            percentile_df = pd.DataFrame({
-                                'Percentile': percentiles,
-                                'Year': percentile_values
-                            })
-                            st.dataframe(percentile_df)
-                            
-                        # Additional analysis by state
-                        if "State" in waste_data.columns:
-                            st.write("### Annual Waste Acceptance Year by State")
-                            
-                            # Calculate average year by state
-                            state_data = waste_data.groupby("State")["Annual Waste Acceptance Year"].agg(['mean', 'count', 'min', 'max']).reset_index()
-                            state_data.columns = ['State', 'Average Year', 'Number of Landfills', 'Earliest Year', 'Latest Year']
-                            
-                            # Round years to integers
-                            state_data['Average Year'] = state_data['Average Year'].round().astype(int)
-                            state_data['Earliest Year'] = state_data['Earliest Year'].astype(int)
-                            state_data['Latest Year'] = state_data['Latest Year'].astype(int)
-                            
-                            # Sort by average year
-                            state_data = state_data.sort_values('Average Year', ascending=False)
-                            
-                            # Show top states with most recent data
-                            top_states = state_data.head(10)
-                            
-                            # Create bar chart
-                            fig_state, ax_state = plt.subplots(figsize=(10, 6))
-                            sns.barplot(
-                                data=top_states,
-                                x='State',
-                                y='Average Year',
-                                ax=ax_state
-                            )
-                            ax_state.set_title('Top 10 States by Most Recent Waste Acceptance Data')
-                            ax_state.set_ylabel('Average Year of Data')
-                            ax_state.set_xlabel('State')
-                            plt.xticks(rotation=45)
-                            
-                            for i, v in enumerate(top_states['Average Year']):
-                                ax_state.text(i, v - 3, f"{int(v)}", ha='center')
-                                
-                            plt.tight_layout()
-                            st.pyplot(fig_state)
-                            
-                            # Show full state data in an expandable section
-                            with st.expander("View data for all states"):
-                                st.dataframe(state_data)
-                    else:
-                        st.warning("No Annual Waste Acceptance Year data available for visualization.")
-                except Exception as e:
-                    st.error(f"Error creating Annual Waste Acceptance Year histogram: {e}")
-            
-            elif advanced_viz_type == "Multiple Factors Analysis":
-                try:
-                    # Select relevant columns for analysis
-                    analysis_cols = [
-                        "LFG Collected (mmscfd)", 
-                        "Percent Methane", 
-                        "Waste in Place (tons)", 
-                        "Annual Waste Acceptance Year",
-                        "Current Landfill Depth (feet)"
-                    ]
-                    
-                    # Add fiber metrics if available
-                    if fiber_data_available and "Nearest_Fiber_Distance_km" in df_dash.columns:
-                        analysis_cols.append("Nearest_Fiber_Distance_km")
-                    if fiber_data_available and "Fiber_Download_Speed" in df_dash.columns:
-                        analysis_cols.append("Fiber_Download_Speed")
-                    if fiber_data_available and "Fiber_Locations_Within_10km" in df_dash.columns:
-                        analysis_cols.append("Fiber_Locations_Within_10km")
-                    
-                    # Create a copy and convert to numeric
-                    multi_df = df_dash[analysis_cols].copy()
-                    for col in multi_df.columns:
-                        multi_df[col] = pd.to_numeric(multi_df[col], errors="coerce")
-                    
-                    # Drop rows with all NaN values
-                    multi_df = multi_df.dropna(how="all")
-                    
-                    if not multi_df.empty:
-                        st.write("### Correlation Analysis")
-                        
-                        # Calculate and display correlation matrix
-                        corr_matrix = multi_df.corr()
-                        
-                        # Create heatmap
-                        fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
-                        mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
-                        cmap = sns.diverging_palette(220, 10, as_cmap=True)
-                        
-                        sns.heatmap(
-                            corr_matrix, 
-                            mask=mask,
-                            cmap=cmap,
-                            annot=True,
-                            fmt=".2f",
-                            center=0,
-                            square=True,
-                            linewidths=.5,
-                            ax=ax_corr
-                        )
-                        
-                        ax_corr.set_title("Correlation Matrix of Key Metrics")
-                        plt.tight_layout()
-                        st.pyplot(fig_corr)
-                        
-                        # Create pairplot for deeper analysis
-                        st.write("### Pairwise Relationships")
-                        
-                        # Sample data if more than 500 points to keep plot responsive
-                        plot_df = multi_df
-                        if len(multi_df) > 500:
-                            plot_df = multi_df.sample(500)
-                            st.info(f"Showing a random sample of 500 landfills (out of {len(multi_df)}) for faster rendering.")
-                        
-                        # Scale waste values for better visualization
-                        if "Waste in Place (tons)" in plot_df.columns:
-                            plot_df["Waste in Place (M tons)"] = plot_df["Waste in Place (tons)"] / 1e6
-                            plot_df = plot_df.drop("Waste in Place (tons)", axis=1)
-                            
-                        if "Annual Waste Acceptance Year" in plot_df.columns:
-                            # Keep the year as is, no need to scale
-                            plot_df = plot_df
-                        
-                        # Create pairplot
-                        with st.spinner("Generating pairplot... this may take a moment"):
-                            pair_fig = sns.pairplot(
-                                plot_df.dropna(), 
-                                diag_kind="kde",
-                                plot_kws={"alpha": 0.6}
-                            )
-                            pair_fig.fig.suptitle("Pairwise Relationships Between Key Metrics", y=1.02)
-                            st.pyplot(pair_fig.fig)
-                        
-                        # Key insights section
-                        st.write("### Key Insights")
-                        
-                        # Find strongest correlations
-                        strong_correlations = []
-                        for i in range(len(corr_matrix.columns)):
-                            for j in range(i+1, len(corr_matrix.columns)):
-                                col1 = corr_matrix.columns[i]
-                                col2 = corr_matrix.columns[j]
-                                corr_value = corr_matrix.iloc[i, j]
-                                if abs(corr_value) > 0.3:  # Arbitrary threshold for moderate correlation
-                                    strong_correlations.append({
-                                        'Variable 1': col1,
-                                        'Variable 2': col2,
-                                        'Correlation': corr_value
-                                    })
-                        
-                        strong_corr_df = pd.DataFrame(strong_correlations).sort_values('Correlation', key=abs, ascending=False)
-                        if not strong_corr_df.empty:
-                            st.write("**Strongest Variable Relationships:**")
-                            st.dataframe(strong_corr_df)
-                            
-                            # Write some interpretations
-                            st.write("**Interpretation:**")
-                            top_corr = strong_corr_df.iloc[0]
-                            
-                            if abs(top_corr['Correlation']) > 0.7:
-                                strength = "very strong"
-                            elif abs(top_corr['Correlation']) > 0.5:
-                                strength = "strong"
-                            else:
-                                strength = "moderate"
-                                
-                            direction = "positive" if top_corr['Correlation'] > 0 else "negative"
-                            
-                            st.write(f"- There is a {strength} {direction} correlation ({top_corr['Correlation']:.2f}) between {top_corr['Variable 1']} and {top_corr['Variable 2']}.")
-                            
-                            if len(strong_corr_df) > 1:
-                                second_corr = strong_corr_df.iloc[1]
-                                if abs(second_corr['Correlation']) > 0.7:
-                                    strength = "very strong"
-                                elif abs(second_corr['Correlation']) > 0.5:
-                                    strength = "strong"
-                                else:
-                                    strength = "moderate"
-                                    
-                                direction = "positive" if second_corr['Correlation'] > 0 else "negative"
-                                
-                                st.write(f"- There is a {strength} {direction} correlation ({second_corr['Correlation']:.2f}) between {second_corr['Variable 1']} and {second_corr['Variable 2']}.")
-                        else:
-                            st.write("No strong correlations found between the variables.")
-                            
-                    else:
-                        st.warning("Insufficient data for multi-factor analysis. More data points with complete information are needed.")
-                except Exception as e:
-                    st.error(f"Error creating multiple factors analysis: {e}")
-        
+                    st.error(f"Error creating Waste vs LFG plot: {e}")        
         # NEW TAB FOR FIBER CONNECTIVITY ANALYSIS
         if fiber_data_available:
             with tab5:
